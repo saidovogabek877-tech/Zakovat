@@ -2,1261 +2,899 @@
 import os
 import time
 import sqlite3
-import html
+import logging
 import requests
-from datetime import datetime, timezone, timedelta
 
-# ============================================================
-# CONFIG
-# ============================================================
+from datetime import datetime
 
-TOKEN = os.getenv("BOT_TOKEN")
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN topilmadi. FadeHost Environment sozlamalarini tekshiring.")
+# ========== SOZLAMALAR ==========
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID = int(os.getenv("ADMIN_ID", "5607350126"))
+CHANNEL_ID = os.getenv("CHANNEL_ID", "@zakalgoritm")
 
-ADMIN_ID = 5607350126
-CHANNEL = "@zakalgoritm"
 API = f"https://api.telegram.org/bot{TOKEN}"
+DB_NAME = "zakovat.db"
+BOT_USERNAME = ""
 
-TZ = timezone(timedelta(hours=5))
-DB_FILE = "zakovat.db"
-DEFAULT_DURATION = 900
-ALLOWED_DURATIONS = {60, 120, 180, 600, 900, 1800, 3600}
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("ALGORITM")
 
-# ============================================================
-# DATABASE
-# ============================================================
+session = requests.Session()
+states = {}
+offset = 0
 
-db = sqlite3.connect(DB_FILE, check_same_thread=False)
-db.row_factory = sqlite3.Row
 
-db.executescript("""
-CREATE TABLE IF NOT EXISTS members (
-    user_id INTEGER PRIMARY KEY,
-    username TEXT DEFAULT '',
-    first_name TEXT DEFAULT '',
-    joined_at INTEGER
-);
+# ========== BAZA ==========
+def connect():
+    conn = sqlite3.connect(DB_NAME, timeout=20)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-CREATE TABLE IF NOT EXISTS questions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    question TEXT NOT NULL,
-    correct_answer TEXT NOT NULL,
-    variants TEXT DEFAULT '',
-    duration INTEGER NOT NULL,
-    created_at INTEGER NOT NULL,
-    start_time INTEGER,
-    active INTEGER DEFAULT 0
-);
 
-CREATE TABLE IF NOT EXISTS answers (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    question_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    username TEXT DEFAULT '',
-    first_name TEXT DEFAULT '',
-    answer TEXT NOT NULL,
-    correct INTEGER DEFAULT 0,
-    points INTEGER DEFAULT 0,
-    created_at INTEGER NOT NULL,
-    UNIQUE(question_id, user_id)
-);
+def init_db():
+    with connect() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS members (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT DEFAULT '',
+            first_name TEXT DEFAULT ''
+        );
 
-CREATE TABLE IF NOT EXISTS scores (
-    user_id INTEGER PRIMARY KEY,
-    points INTEGER DEFAULT 0
-);
+        CREATE TABLE IF NOT EXISTS scores (
+            user_id INTEGER PRIMARY KEY,
+            points INTEGER DEFAULT 0
+        );
 
-CREATE TABLE IF NOT EXISTS score_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    points INTEGER,
-    reason TEXT,
-    created_at INTEGER
-);
+        CREATE TABLE IF NOT EXISTS score_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            points INTEGER,
+            reason TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
 
-CREATE TABLE IF NOT EXISTS prizes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    week_key TEXT UNIQUE,
-    winner_user_id INTEGER,
-    prize TEXT DEFAULT '',
-    created_at INTEGER
-);
+        CREATE TABLE IF NOT EXISTS tournaments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            status TEXT DEFAULT 'ready',
+            current_number INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
 
-CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
-""")
-db.commit()
+        CREATE TABLE IF NOT EXISTS tournament_questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tournament_id INTEGER,
+            number INTEGER,
+            question TEXT,
+            answer TEXT,
+            variants TEXT DEFAULT '',
+            duration INTEGER,
+            status TEXT DEFAULT 'pending',
+            deadline REAL
+        );
 
-# ============================================================
-# TELEGRAM API
-# ============================================================
+        CREATE TABLE IF NOT EXISTS tournament_answers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            question_id INTEGER,
+            user_id INTEGER,
+            answer TEXT,
+            points_awarded INTEGER DEFAULT 0,
+            reviewed INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(question_id, user_id)
+        );
 
-def tg(method, data=None):
+        CREATE TABLE IF NOT EXISTS questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            question TEXT,
+            answer TEXT,
+            variants TEXT DEFAULT '',
+            duration INTEGER,
+            status TEXT DEFAULT 'draft',
+            deadline REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS answers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            question_id INTEGER,
+            user_id INTEGER,
+            answer TEXT,
+            points_awarded INTEGER DEFAULT 0,
+            UNIQUE(question_id, user_id)
+        );
+        """)
+
+
+# ========== TELEGRAM API ==========
+def api(method, data=None):
     try:
-        response = requests.post(
+        response = session.post(
             f"{API}/{method}",
             json=data or {},
             timeout=35
         )
-        result = response.json()
-        if not result.get("ok"):
-            print("Telegram API:", result)
-        return result
+        return response.json()
     except Exception as e:
-        print("Telegram ERROR:", e)
-        return {}
+        log.exception("Telegram API xatosi: %s", e)
+        return {"ok": False}
 
 
-def send_message(chat_id, text, keyboard=None):
+def send(chat_id, text, markup=None):
     data = {
         "chat_id": chat_id,
         "text": text,
-        "parse_mode": "HTML"
+        "disable_web_page_preview": True
     }
-    if keyboard:
-        data["reply_markup"] = {"inline_keyboard": keyboard}
-    return tg("sendMessage", data)
+    if markup:
+        data["reply_markup"] = markup
+    return api("sendMessage", data)
 
 
-def edit_message(chat_id, message_id, text, keyboard=None):
-    data = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text,
-        "parse_mode": "HTML"
-    }
-    if keyboard:
-        data["reply_markup"] = {"inline_keyboard": keyboard}
-    return tg("editMessageText", data)
+def buttons(rows):
+    return {"inline_keyboard": rows}
 
 
-def callback_answer(callback_id, text=""):
-    tg("answerCallbackQuery", {
-        "callback_query_id": callback_id,
-        "text": text
-    })
+def admin(user_id):
+    return int(user_id) == ADMIN_ID
 
 
-# ============================================================
-# HELPERS
-# ============================================================
+def member_name(user_id):
+    with connect() as c:
+        row = c.execute(
+            "SELECT username, first_name FROM members WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
 
-def now():
-    return int(time.time())
+    if not row:
+        return str(user_id)
 
+    if row["username"]:
+        return "@" + row["username"]
 
-def clean(text):
-    if not text:
-        return ""
-    return (
-        text.lower().strip()
-        .replace("’", "'")
-        .replace("‘", "'")
-        .replace("`", "'")
-    )
+    return row["first_name"] or str(user_id)
 
-
-def get_setting(key, default=None):
-    row = db.execute(
-        "SELECT value FROM settings WHERE key=?", (key,)
-    ).fetchone()
-    return row["value"] if row else default
-
-
-def set_setting(key, value):
-    db.execute("""
-        INSERT INTO settings(key, value)
-        VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-    """, (key, str(value)))
-    db.commit()
-
-
-def get_duration():
-    try:
-        value = int(get_setting("question_duration", DEFAULT_DURATION))
-        return value if value in ALLOWED_DURATIONS else DEFAULT_DURATION
-    except (TypeError, ValueError):
-        return DEFAULT_DURATION
-
-
-def format_duration(seconds):
-    return f"{seconds // 60} daqiqa"
-
-
-def safe_text(value):
-    return html.escape(str(value or ""))
-
-
-# ============================================================
-# MEMBERS
-# ============================================================
 
 def save_member(user):
-    db.execute("""
-        INSERT INTO members(user_id, username, first_name, joined_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
+    uid = user["id"]
+
+    with connect() as c:
+        c.execute("""
+            INSERT INTO members(user_id, username, first_name)
+            VALUES(?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET
             username=excluded.username,
             first_name=excluded.first_name
-    """, (
-        user["id"],
-        user.get("username", ""),
-        user.get("first_name", ""),
-        now()
-    ))
-    db.commit()
+        """, (
+            uid,
+            user.get("username", ""),
+            user.get("first_name", "")
+        ))
+
+        c.execute(
+            "INSERT OR IGNORE INTO scores(user_id,points) VALUES(?,0)",
+            (uid,)
+        )
 
 
-# ============================================================
-# SCORES AND LEVELS
-# ============================================================
-
-def get_score(user_id):
-    row = db.execute(
-        "SELECT points FROM scores WHERE user_id=?", (user_id,)
-    ).fetchone()
-    return row["points"] if row else 0
-
-
-def add_score(user_id, points, reason):
-    new_score = get_score(user_id) + points
-
-    db.execute("""
-        INSERT INTO scores(user_id, points)
-        VALUES (?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET points=excluded.points
-    """, (user_id, new_score))
-
-    db.execute("""
-        INSERT INTO score_history(user_id, points, reason, created_at)
-        VALUES (?, ?, ?, ?)
-    """, (user_id, points, reason, now()))
-
-    db.commit()
+def add_points(user_id, points, reason):
+    with connect() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO scores(user_id,points) VALUES(?,0)",
+            (user_id,)
+        )
+        c.execute(
+            "UPDATE scores SET points=points+? WHERE user_id=?",
+            (points, user_id)
+        )
+        c.execute("""
+            INSERT INTO score_history(user_id,points,reason)
+            VALUES(?,?,?)
+        """, (user_id, points, reason))
 
 
-def get_level(points):
-    if points <= 10:
-        return "🌱 Beginner"
-    if points <= 30:
-        return "📘 Bilimdon"
-    if points <= 60:
-        return "🧠 Zakovatchi"
-    return "👑 Usta"
+def bot_link(payload):
+    return f"https://t.me/{BOT_USERNAME}?start={payload}"
 
 
-# Temporary states: cleared if the bot restarts.
-states = {}
-
-
-# ============================================================
-# ADMIN PANEL
-# ============================================================
-
+# ========== ADMIN MENYUSI ==========
 def admin_keyboard():
-    return [
+    return buttons([
         [
-            {"text": "🧠 Savol qo‘shish", "callback_data": "admin_add"},
-            {"text": "📋 Javoblar", "callback_data": "admin_answers"}
+            {"text": "🏆 Turnirlar", "callback_data": "t:list"},
+            {"text": "➕ Oddiy savol", "callback_data": "q:new"}
         ],
         [
-            {"text": "🏆 Reyting", "callback_data": "admin_rating"},
-            {"text": "👥 A’zolar", "callback_data": "admin_members"}
+            {"text": "🏅 Reyting", "callback_data": "rating"},
+            {"text": "👥 A'zolar", "callback_data": "members"}
         ],
         [
-            {"text": "📊 Statistika", "callback_data": "admin_stats"},
-            {"text": "📚 Savollar tarixi", "callback_data": "admin_history"}
-        ],
-        [
-            {"text": "➕ Ball boshqaruvi", "callback_data": "admin_points"},
-            {"text": "📢 Xabar yuborish", "callback_data": "admin_broadcast"}
-        ],
-        [
-            {"text": "⏱️ Savol vaqti", "callback_data": "admin_time"},
-            {"text": "🎁 Haftalik g‘oliblar", "callback_data": "admin_winners"}
+            {"text": "📊 Statistika", "callback_data": "stats"},
+            {"text": "📣 Xabar yuborish", "callback_data": "broadcast"}
         ]
-    ]
+    ])
 
 
 def show_admin(chat_id):
-    if chat_id != ADMIN_ID:
-        return
-    send_message(
-        chat_id,
-        "<b>⚙️ ADMIN PANEL</b>\n\nKerakli bo‘limni tanlang:",
-        admin_keyboard()
-    )
+    send(chat_id, "🛠 ALGORITM ZAKOVAT — ADMIN PANEL", admin_keyboard())
 
 
-# ============================================================
-# QUESTION CREATION
-# ============================================================
+# ========== TURNIR YARATISH ==========
+def create_tournament(user_id):
+    states[user_id] = {"mode": "t_name"}
+    send(user_id, "🏆 Turnir nomini yuboring.\nBekor qilish: /cancel")
 
-def start_question(chat_id):
-    if chat_id != ADMIN_ID:
-        return
 
-    states[chat_id] = {
-        "state": "question",
-        "duration": get_duration()
-    }
-    send_message(chat_id, "<b>🧠 Yangi savol</b>\n\nSavol matnini yuboring.")
+def tournament_input(user_id, text):
+    st = states[user_id]
+    mode = st["mode"]
 
+    if mode == "t_name":
+        name = text.strip()
 
-def process_question(chat_id, text):
-    state = states.get(chat_id)
-    if not state:
-        return False
-
-    if state["state"] == "question":
-        state["question"] = text
-        state["state"] = "answer"
-        send_message(chat_id, "✅ Endi <b>to‘g‘ri javobni</b> yuboring.")
-        return True
-
-    if state["state"] == "answer":
-        state["answer"] = text
-        state["state"] = "variants"
-        send_message(
-            chat_id,
-            "🔤 Qabul qilinadigan javob variantlarini vergul bilan yozing.\n\n"
-            "Masalan: <code>Toshkent,tashkent,Тошкент</code>\n\n"
-            "Variant kerak bo‘lmasa <code>-</code> yuboring."
-        )
-        return True
-
-    if state["state"] == "variants":
-        variants = "" if text.strip() == "-" else text
-        state["variants"] = variants
-        state["state"] = "preview"
-
-        send_message(
-            chat_id,
-            "<b>📋 SAVOL PREVYU</b>\n\n"
-            f"🧠 {safe_text(state['question'])}\n\n"
-            f"✅ Javob: {safe_text(state['answer'])}\n"
-            f"🔤 Variantlar: {safe_text(variants or 'yo‘q')}\n"
-            f"⏱️ Vaqt: {format_duration(state['duration'])}",
-            [[
-                {"text": "📢 Tasdiqlash", "callback_data": "question_publish"},
-                {"text": "❌ Bekor qilish", "callback_data": "question_cancel"}
-            ]]
-        )
-        return True
-
-    return False
-
-
-def publish_question(chat_id):
-    state = states.get(chat_id)
-    if chat_id != ADMIN_ID or not state or state.get("state") != "preview":
-        return
-
-    start = now()
-    cur = db.execute("""
-        INSERT INTO questions
-        (question, correct_answer, variants, duration, created_at, start_time, active)
-        VALUES (?, ?, ?, ?, ?, ?, 1)
-    """, (
-        state["question"],
-        state["answer"],
-        state["variants"],
-        state["duration"],
-        start,
-        start
-    ))
-    db.commit()
-    question_id = cur.lastrowid
-
-    keyboard = [[{
-        "text": "📝 Javob berish",
-        "callback_data": f"answer:{question_id}"
-    }]]
-
-    text = (
-        "<b>🧠 ZAKOVAT SAVOLI</b>\n\n"
-        f"{safe_text(state['question'])}\n\n"
-        f"⏱️ Vaqt: {format_duration(state['duration'])}\n\n"
-        "👇 Javob berish uchun tugmani bosing."
-    )
-
-    result = send_message(CHANNEL, text, keyboard)
-    if result.get("ok"):
-        send_message(chat_id, "✅ Savol kanalga muvaffaqiyatli yuborildi!")
-        states.pop(chat_id, None)
-    else:
-        db.execute("UPDATE questions SET active=0 WHERE id=?", (question_id,))
-        db.commit()
-        send_message(
-            chat_id,
-            "❌ Kanalga yuborishda xatolik yuz berdi.\n\n"
-            "Bot kanalga admin ekanini va post yozish huquqini tekshiring."
-        )
-
-
-# ============================================================
-# ANSWER CHECKING
-# ============================================================
-
-def is_correct(user_answer, correct_answer, variants):
-    possible = [correct_answer]
-    if variants:
-        possible += [x.strip() for x in variants.split(",") if x.strip()]
-    user_answer = clean(user_answer)
-    return any(clean(answer) == user_answer for answer in possible)
-
-
-def request_answer(user_id, question_id):
-    states[user_id] = {
-        "state": "answering",
-        "question_id": question_id
-    }
-    send_message(user_id, "📝 Javobingizni yozing:")
-
-
-def process_user_answer(message):
-    user = message["from"]
-    user_id = user["id"]
-    state = states.get(user_id)
-
-    if not state or state.get("state") != "answering":
-        return False
-
-    question_id = state["question_id"]
-    text = message.get("text", "").strip()
-
-    q = db.execute(
-        "SELECT * FROM questions WHERE id=?", (question_id,)
-    ).fetchone()
-
-    if not q:
-        send_message(user_id, "❌ Savol topilmadi.")
-        states.pop(user_id, None)
-        return True
-
-    if not q["active"]:
-        send_message(user_id, "⏰ Bu savol yopilgan.")
-        states.pop(user_id, None)
-        return True
-
-    if now() >= q["start_time"] + q["duration"]:
-        db.execute("UPDATE questions SET active=0 WHERE id=?", (question_id,))
-        db.commit()
-        send_message(user_id, "⏰ Savol vaqti tugagan.")
-        states.pop(user_id, None)
-        return True
-
-    existing = db.execute("""
-        SELECT id FROM answers WHERE question_id=? AND user_id=?
-    """, (question_id, user_id)).fetchone()
-
-    if existing:
-        send_message(user_id, "⚠️ Siz bu savolga allaqachon javob bergansiz.")
-        states.pop(user_id, None)
-        return True
-
-    correct = is_correct(text, q["correct_answer"], q["variants"])
-    points = 1 if correct else 0
-
-    db.execute("""
-        INSERT INTO answers
-        (question_id, user_id, username, first_name, answer, correct, points, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        question_id,
-        user_id,
-        user.get("username", ""),
-        user.get("first_name", ""),
-        text,
-        int(correct),
-        points,
-        now()
-    ))
-    db.commit()
-
-    if correct:
-        add_score(user_id, 1, f"Savol #{question_id}")
-        send_message(user_id, "✅ <b>To‘g‘ri javob!</b>\n\n🏆 +1 ball")
-    else:
-        send_message(user_id, "❌ <b>Noto‘g‘ri javob.</b>\n\nKeyingi savolda omad!")
-
-    username = user.get("username", "")
-    name = user.get("first_name", "Noma’lum")
-
-    send_message(
-        ADMIN_ID,
-        "<b>📩 Yangi javob!</b>\n\n"
-        f"👤 {safe_text(name)}\n"
-        f"🔗 {safe_text('@' + username if username else 'username yo‘q')}\n"
-        f"🆔 <code>{user_id}</code>\n"
-        f"📝 {safe_text(text)}\n"
-        f"{'✅ To‘g‘ri' if correct else '❌ Noto‘g‘ri'}\n"
-        f"🏆 Ball: {points}"
-    )
-
-    states.pop(user_id, None)
-    return True
-
-
-# ============================================================
-# PROFILE
-# ============================================================
-
-def show_profile(chat_id, user_id):
-    member = db.execute(
-        "SELECT * FROM members WHERE user_id=?", (user_id,)
-    ).fetchone()
-
-    score = get_score(user_id)
-
-    row = db.execute("""
-        SELECT COUNT(*) AS total,
-               SUM(CASE WHEN correct=1 THEN 1 ELSE 0 END) AS correct
-        FROM answers WHERE user_id=?
-    """, (user_id,)).fetchone()
-
-    total = row["total"] or 0
-    correct = row["correct"] or 0
-
-    rank = db.execute(
-        "SELECT COUNT(*) + 1 AS rank FROM scores WHERE points > ?",
-        (score,)
-    ).fetchone()["rank"]
-
-    name = member["first_name"] if member else "Foydalanuvchi"
-
-    send_message(
-        chat_id,
-        "<b>👤 PROFIL</b>\n\n"
-        f"👤 {safe_text(name)}\n"
-        f"🏆 Ball: <b>{score}</b>\n"
-        f"🥇 O‘rin: <b>{rank}</b>\n"
-        f"📝 Javoblar: {total}\n"
-        f"✅ To‘g‘ri: {correct}\n"
-        f"🎖️ Daraja: {get_level(score)}"
-    )
-
-
-# ============================================================
-# RATING: ADMIN ONLY
-# ============================================================
-
-def show_rating(chat_id):
-    if chat_id != ADMIN_ID:
-        send_message(chat_id, "🔒 Reyting faqat admin uchun ochiq.")
-        return
-
-    rows = db.execute("""
-        SELECT s.user_id, s.points, m.first_name, m.username
-        FROM scores s
-        LEFT JOIN members m ON m.user_id=s.user_id
-        ORDER BY s.points DESC
-        LIMIT 50
-    """).fetchall()
-
-    if not rows:
-        send_message(chat_id, "🏆 Hozircha reyting bo‘sh.")
-        return
-
-    text = "<b>🏆 ZAKOVAT REYTINGI</b>\n\n"
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-
-    for i, row in enumerate(rows, 1):
-        name = row["first_name"] or row["username"] or "Noma’lum"
-        text += (
-            f"{medals.get(i, str(i) + '.')}"
-            f" {safe_text(name)} — <b>{row['points']}</b> ball\n"
-        )
-
-    send_message(chat_id, text)
-
-
-# ============================================================
-# ADMIN ANSWERS AND MANUAL POINTS
-# ============================================================
-
-def show_answers(chat_id):
-    if chat_id != ADMIN_ID:
-        return
-
-    rows = db.execute("""
-        SELECT * FROM answers ORDER BY id DESC LIMIT 30
-    """).fetchall()
-
-    if not rows:
-        send_message(chat_id, "📋 Hozircha javoblar yo‘q.")
-        return
-
-    text = "<b>📋 SO‘NGGI JAVOBLAR</b>\n\n"
-    keyboard = []
-
-    for row in rows:
-        name = row["first_name"] or row["username"] or str(row["user_id"])
-        status = "✅" if row["correct"] else "❌"
-        text += (
-            f"{status} <b>{safe_text(name)}</b>\n"
-            f"📝 {safe_text(row['answer'])}\n"
-            f"🏆 {row['points']} ball\n\n"
-        )
-        keyboard.append([
-            {"text": f"✅ +1 #{row['id']}", "callback_data": f"correct:{row['id']}"},
-            {"text": f"➕ #{row['id']}", "callback_data": f"plus:{row['id']}"},
-            {"text": f"➖ #{row['id']}", "callback_data": f"minus:{row['id']}"}
-        ])
-
-    send_message(chat_id, text, keyboard)
-
-
-def manual_correct(answer_id):
-    row = db.execute("SELECT * FROM answers WHERE id=?", (answer_id,)).fetchone()
-    if not row:
-        return "Javob topilmadi."
-    if row["points"] >= 1:
-        return "Bu javob uchun ball allaqachon berilgan."
-
-    db.execute("UPDATE answers SET correct=1, points=1 WHERE id=?", (answer_id,))
-    db.commit()
-    add_score(row["user_id"], 1, f"Admin tasdiqladi #{answer_id}")
-    return "✅ +1 ball berildi."
-
-
-def manual_plus(answer_id):
-    row = db.execute("SELECT * FROM answers WHERE id=?", (answer_id,)).fetchone()
-    if not row:
-        return "Javob topilmadi."
-
-    db.execute("UPDATE answers SET points=points+1 WHERE id=?", (answer_id,))
-    db.commit()
-    add_score(row["user_id"], 1, f"Admin +1 #{answer_id}")
-    return "➕ +1 ball berildi."
-
-
-def manual_minus(answer_id):
-    row = db.execute("SELECT * FROM answers WHERE id=?", (answer_id,)).fetchone()
-    if not row:
-        return "Javob topilmadi."
-    if row["points"] <= 0:
-        return "Bu javobda kamaytirish uchun ball yo‘q."
-
-    db.execute("UPDATE answers SET points=points-1 WHERE id=?", (answer_id,))
-    db.commit()
-    add_score(row["user_id"], -1, f"Admin -1 #{answer_id}")
-    return "➖ 1 ball olib tashlandi."
-
-
-# ============================================================
-# MEMBERS AND STATISTICS
-# ============================================================
-
-def show_members(chat_id):
-    if chat_id != ADMIN_ID:
-        return
-
-    total = db.execute("SELECT COUNT(*) AS c FROM members").fetchone()["c"]
-    rows = db.execute("""
-        SELECT first_name, username, user_id
-        FROM members ORDER BY joined_at DESC LIMIT 30
-    """).fetchall()
-
-    text = f"<b>👥 A’ZOLAR</b>\n\nJami: <b>{total}</b>\n\n"
-    for row in rows:
-        name = row["first_name"] or row["username"] or "Noma’lum"
-        text += f"• {safe_text(name)} <code>{row['user_id']}</code>\n"
-
-    send_message(chat_id, text)
-
-
-def show_stats(chat_id):
-    if chat_id != ADMIN_ID:
-        return
-
-    members = db.execute("SELECT COUNT(*) AS c FROM members").fetchone()["c"]
-    questions = db.execute("SELECT COUNT(*) AS c FROM questions").fetchone()["c"]
-    answers = db.execute("SELECT COUNT(*) AS c FROM answers").fetchone()["c"]
-    correct = db.execute(
-        "SELECT COUNT(*) AS c FROM answers WHERE correct=1"
-    ).fetchone()["c"]
-    active = db.execute(
-        "SELECT COUNT(*) AS c FROM questions WHERE active=1"
-    ).fetchone()["c"]
-
-    send_message(
-        chat_id,
-        "<b>📊 STATISTIKA</b>\n\n"
-        f"👥 A’zolar: {members}\n"
-        f"🧠 Savollar: {questions}\n"
-        f"📝 Javoblar: {answers}\n"
-        f"✅ To‘g‘ri: {correct}\n"
-        f"❌ Noto‘g‘ri: {answers - correct}\n"
-        f"🟢 Faol savollar: {active}"
-    )
-
-
-def show_history(chat_id):
-    if chat_id != ADMIN_ID:
-        return
-
-    rows = db.execute("""
-        SELECT id, question, duration, created_at, active
-        FROM questions ORDER BY id DESC LIMIT 20
-    """).fetchall()
-
-    if not rows:
-        send_message(chat_id, "📚 Savollar tarixi bo‘sh.")
-        return
-
-    text = "<b>📚 SAVOLLAR TARIXI</b>\n\n"
-    for row in rows:
-        status = "🟢" if row["active"] else "🔴"
-        text += (
-            f"{status} <b>#{row['id']}</b>\n"
-            f"{safe_text(row['question'][:120])}\n"
-            f"⏱️ {format_duration(row['duration'])}\n\n"
-        )
-    send_message(chat_id, text)
-
-
-# ============================================================
-# QUESTION DURATION MENU
-# ============================================================
-
-def show_time_menu(chat_id):
-    if chat_id != ADMIN_ID:
-        return
-
-    current = get_duration()
-    keyboard = [
-        [
-            {"text": "1 daqiqa", "callback_data": "time:60"},
-            {"text": "2 daqiqa", "callback_data": "time:120"}
-        ],
-        [
-            {"text": "3 daqiqa", "callback_data": "time:180"},
-            {"text": "10 daqiqa", "callback_data": "time:600"}
-        ],
-        [
-            {"text": "15 daqiqa", "callback_data": "time:900"},
-            {"text": "30 daqiqa", "callback_data": "time:1800"}
-        ],
-        [{"text": "60 daqiqa", "callback_data": "time:3600"}]
-    ]
-
-    send_message(
-        chat_id,
-        "<b>⏱️ SAVOL VAQTI</b>\n\n"
-        f"Joriy vaqt: <b>{format_duration(current)}</b>\n\n"
-        "Yangi vaqtni tanlang:",
-        keyboard
-    )
-
-
-# ============================================================
-# BROADCAST
-# ============================================================
-
-def start_broadcast(chat_id):
-    if chat_id != ADMIN_ID:
-        return
-
-    states[chat_id] = {"state": "broadcast"}
-    send_message(
-        chat_id,
-        "📢 Barcha a’zolarga yuboriladigan xabarni yozing.\n\n"
-        "Bekor qilish uchun /bekor yuboring."
-    )
-
-
-def do_broadcast(chat_id, text):
-    if chat_id != ADMIN_ID:
-        return
-
-    rows = db.execute("SELECT user_id FROM members").fetchall()
-    success = 0
-    failed = 0
-
-    for row in rows:
-        result = send_message(row["user_id"], safe_text(text))
-        if result.get("ok"):
-            success += 1
-        else:
-            failed += 1
-        time.sleep(0.08)
-
-    send_message(
-        chat_id,
-        "<b>📢 XABAR YUBORILDI</b>\n\n"
-        f"✅ Yetib bordi: {success}\n"
-        f"❌ Yetib bormadi: {failed}"
-    )
-
-
-# ============================================================
-# WEEKLY TOP: SCORE HISTORY FOR CURRENT WEEK
-# ============================================================
-
-def week_start_timestamp():
-    dt = datetime.now(TZ)
-    monday = (dt - timedelta(days=dt.weekday())).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    return int(monday.timestamp())
-
-
-def weekly_top():
-    start = week_start_timestamp()
-
-    return db.execute("""
-        SELECT
-            h.user_id,
-            SUM(h.points) AS points,
-            m.first_name,
-            m.username
-        FROM score_history h
-        LEFT JOIN members m ON m.user_id=h.user_id
-        WHERE h.created_at >= ?
-        GROUP BY h.user_id
-        ORDER BY points DESC
-        LIMIT 3
-    """, (start,)).fetchall()
-
-
-# ============================================================
-# CALLBACK HANDLER
-# ============================================================
-
-def handle_callback(query):
-    user = query["from"]
-    user_id = user["id"]
-    data = query.get("data", "")
-    message = query.get("message", {})
-    chat_id = message.get("chat", {}).get("id", user_id)
-
-    save_member(user)
-
-    # Contact button: user asks to contact admin.
-    if data == "contact_admin":
-        states[user_id] = {"state": "contact_message"}
-        send_message(
-            user_id,
-            "📩 Adminga yubormoqchi bo‘lgan xabaringizni yozing.\n\n"
-            "Bekor qilish uchun /bekor yuboring."
-        )
-        callback_answer(query["id"])
-        return
-
-    # Reply to a user's contact message.
-    if data.startswith("contact_reply:"):
-        if user_id != ADMIN_ID:
-            callback_answer(query["id"], "Bu amal faqat admin uchun.")
+        if not name:
+            send(user_id, "Turnir nomini kiriting.")
             return
 
-        try:
-            target_id = int(data.split(":", 1)[1])
-        except (ValueError, IndexError):
-            callback_answer(query["id"], "Foydalanuvchi ID xato.")
-            return
+        with connect() as c:
+            c.execute(
+                "INSERT INTO tournaments(name,status) VALUES(?,'ready')",
+                (name,)
+            )
+            tid = c.execute(
+                "SELECT last_insert_rowid()"
+            ).fetchone()[0]
 
-        states[ADMIN_ID] = {
-            "state": "contact_reply",
-            "target_id": target_id
+        states[user_id] = {
+            "mode": "t_count",
+            "tid": tid,
+            "name": name
         }
-        send_message(
-            ADMIN_ID,
-            "✍️ Foydalanuvchiga yuboriladigan javobni yozing.\n\n"
-            "Bekor qilish uchun /bekor yuboring."
-        )
-        callback_answer(query["id"])
+        send(user_id, "Turnirda nechta savol bo'ladi? 1–100 oralig'ida kiriting.")
         return
 
-    # All admin callbacks must be restricted.
-    admin_callbacks = {
-        "admin_add", "admin_answers", "admin_rating",
-        "admin_members", "admin_stats", "admin_history",
-        "admin_points", "admin_broadcast", "admin_time",
-        "admin_winners", "question_publish", "question_cancel"
-    }
-
-    if data in admin_callbacks or data.startswith(
-        ("correct:", "plus:", "minus:", "time:")
-    ):
-        if user_id != ADMIN_ID:
-            callback_answer(query["id"], "❌ Bu amal faqat admin uchun.")
+    if mode == "t_count":
+        try:
+            count = int(text)
+            if not 1 <= count <= 100:
+                raise ValueError
+        except ValueError:
+            send(user_id, "1 dan 100 gacha butun son kiriting.")
             return
 
-    if data == "admin_add":
-        start_question(chat_id)
-        callback_answer(query["id"])
+        st["count"] = count
+        st["number"] = 1
+        st["mode"] = "t_question"
+        send(user_id, f"📝 1/{count}-savol matnini yuboring.")
         return
 
-    if data == "admin_answers":
-        show_answers(chat_id)
-        callback_answer(query["id"])
+    if mode == "t_question":
+        st["question"] = text.strip()
+        st["mode"] = "t_answer"
+        send(user_id, "To'g'ri javobni yuboring.")
         return
 
-    if data == "admin_rating":
-        show_rating(chat_id)
-        callback_answer(query["id"])
-        return
-
-    if data == "admin_members":
-        show_members(chat_id)
-        callback_answer(query["id"])
-        return
-
-    if data == "admin_stats":
-        show_stats(chat_id)
-        callback_answer(query["id"])
-        return
-
-    if data == "admin_history":
-        show_history(chat_id)
-        callback_answer(query["id"])
-        return
-
-    if data == "admin_points":
-        send_message(
-            chat_id,
-            "➕/➖ Ball boshqaruvi\n\n"
-            "📋 Javoblar bo‘limidan kerakli javob yonidagi "
-            "tugmalar orqali ball bering yoki olib tashlang."
+    if mode == "t_answer":
+        st["answer"] = text.strip()
+        st["mode"] = "t_variants"
+        send(
+            user_id,
+            "Muqobil javoblarni | bilan ajrating.\n"
+            "Masalan: Toshkent|TASHKENT\n"
+            "Muqobil javob yo'q bo'lsa - yuboring."
         )
-        callback_answer(query["id"])
         return
 
-    if data == "admin_broadcast":
-        start_broadcast(chat_id)
-        callback_answer(query["id"])
+    if mode == "t_variants":
+        st["variants"] = (
+            "" if text.strip() == "-"
+            else "|".join(x.strip() for x in text.split("|") if x.strip())
+        )
+        st["mode"] = "t_duration"
+        send(
+            user_id,
+            "⏱ Javob berish vaqtini soniyada kiriting.\n"
+            "2 daqiqa = 120\n3 daqiqa = 180"
+        )
         return
 
-    if data == "admin_time":
-        show_time_menu(chat_id)
-        callback_answer(query["id"])
-        return
+    if mode == "t_duration":
+        try:
+            duration = int(text)
+            if not 10 <= duration <= 7200:
+                raise ValueError
+        except ValueError:
+            send(user_id, "10–7200 soniya oralig'ida kiriting.")
+            return
 
-    if data == "admin_winners":
-        rows = weekly_top()
-        if not rows:
-            send_message(chat_id, "🎁 Bu hafta uchun g‘oliblar hozircha yo‘q.")
+        with connect() as c:
+            c.execute("""
+                INSERT INTO tournament_questions
+                (tournament_id,number,question,answer,variants,duration,status)
+                VALUES(?,?,?,?,?,?,'pending')
+            """, (
+                st["tid"],
+                st["number"],
+                st["question"],
+                st["answer"],
+                st["variants"],
+                duration
+            ))
+
+        if st["number"] < st["count"]:
+            st["number"] += 1
+            st["mode"] = "t_question"
+            send(
+                user_id,
+                f"✅ Savol saqlandi.\n📝 {st['number']}/{st['count']}-savol matnini yuboring."
+            )
         else:
-            text = "<b>🎁 HAFTALIK TOP-3</b>\n\n"
-            for i, row in enumerate(rows, 1):
-                name = row["first_name"] or row["username"] or "Noma’lum"
-                text += f"{i}. {safe_text(name)} — <b>{row['points']}</b> ball\n"
-            send_message(chat_id, text)
-        callback_answer(query["id"])
-        return
-
-    if data.startswith("time:"):
-        try:
-            seconds = int(data.split(":", 1)[1])
-        except ValueError:
-            callback_answer(query["id"], "Vaqt qiymati xato.")
-            return
-
-        if seconds not in ALLOWED_DURATIONS:
-            callback_answer(query["id"], "Bu vaqt varianti mavjud emas.")
-            return
-
-        set_setting("question_duration", seconds)
-        send_message(
-            chat_id,
-            f"✅ Keyingi savollar uchun vaqt "
-            f"<b>{format_duration(seconds)}</b> qilib o‘rnatildi."
-        )
-        callback_answer(query["id"], "Vaqt saqlandi.")
-        return
-
-    if data == "question_publish":
-        publish_question(chat_id)
-        callback_answer(query["id"], "Bajarildi.")
-        return
-
-    if data == "question_cancel":
-        states.pop(ADMIN_ID, None)
-        send_message(chat_id, "❌ Savol bekor qilindi.")
-        callback_answer(query["id"], "Bekor qilindi.")
-        return
-
-    if data.startswith("answer:"):
-        try:
-            question_id = int(data.split(":", 1)[1])
-        except ValueError:
-            callback_answer(query["id"], "Savol ID xato.")
-            return
-
-        q = db.execute(
-            "SELECT * FROM questions WHERE id=?", (question_id,)
-        ).fetchone()
-
-        if not q:
-            callback_answer(query["id"], "❌ Savol topilmadi.")
-            return
-
-        if not q["active"]:
-            callback_answer(query["id"], "⏰ Savol yopilgan.")
-            return
-
-        if now() >= q["start_time"] + q["duration"]:
-            db.execute("UPDATE questions SET active=0 WHERE id=?", (question_id,))
-            db.commit()
-            callback_answer(query["id"], "⏰ Vaqt tugagan.")
-            return
-
-        request_answer(user_id, question_id)
-        callback_answer(query["id"])
-        return
-
-    # These buttons change scores, so admin permission is required.
-    if data.startswith("correct:"):
-        result = manual_correct(int(data.split(":", 1)[1]))
-        send_message(chat_id, result)
-        callback_answer(query["id"])
-        return
-
-    if data.startswith("plus:"):
-        result = manual_plus(int(data.split(":", 1)[1]))
-        send_message(chat_id, result)
-        callback_answer(query["id"])
-        return
-
-    if data.startswith("minus:"):
-        result = manual_minus(int(data.split(":", 1)[1]))
-        send_message(chat_id, result)
-        callback_answer(query["id"])
-        return
-
-
-# ============================================================
-# MESSAGE HANDLER
-# ============================================================
-
-def handle_message(message):
-    user = message["from"]
-    user_id = user["id"]
-    chat_id = message["chat"]["id"]
-    text = message.get("text", "").strip()
-
-    save_member(user)
-
-    # Handle contact message first.
-    state = states.get(user_id)
-
-    if state and state.get("state") == "contact_message":
-        if text == "/bekor":
+            tid = st["tid"]
+            name = st["name"]
             states.pop(user_id, None)
-            send_message(chat_id, "❌ Murojaat bekor qilindi.")
-            return
 
-        if not text:
-            send_message(chat_id, "Iltimos, matnli xabar yuboring.")
-            return
-
-        name = safe_text(user.get("first_name", "Foydalanuvchi"))
-        username = user.get("username", "")
-        safe_username = safe_text("@" + username) if username else "username yo‘q"
-
-        result = send_message(
-            ADMIN_ID,
-            "<b>📩 YANGI MUROJAAT</b>\n\n"
-            f"👤 {name}\n"
-            f"🔗 {safe_username}\n"
-            f"🆔 <code>{user_id}</code>\n\n"
-            f"💬 {safe_text(text)}",
-            [[{
-                "text": "↩️ Javob berish",
-                "callback_data": f"contact_reply:{user_id}"
-            }]]
-        )
-
-        if result.get("ok"):
-            send_message(chat_id, "✅ Murojaatingiz adminga yuborildi.")
-        else:
-            send_message(chat_id, "❌ Xabar yuborilmadi. Keyinroq urinib ko‘ring.")
-
-        states.pop(user_id, None)
-        return
-
-    # Handle admin's reply to a contact message.
-    if user_id == ADMIN_ID and state and state.get("state") == "contact_reply":
-        if text == "/bekor":
-            states.pop(ADMIN_ID, None)
-            send_message(chat_id, "❌ Javob yuborish bekor qilindi.")
-            return
-
-        if not text:
-            send_message(chat_id, "Iltimos, javob matnini yozing.")
-            return
-
-        target_id = state["target_id"]
-        result = send_message(
-            target_id,
-            "📩 <b>Admin javobi:</b>\n\n" + safe_text(text)
-        )
-
-        if result.get("ok"):
-            send_message(chat_id, "✅ Javob foydalanuvchiga yuborildi.")
-        else:
-            send_message(
-                chat_id,
-                "❌ Javob yuborilmadi. Foydalanuvchi botni /start orqali ishga tushirganini tekshiring."
+            send(
+                user_id,
+                f"🎉 Turnir saqlandi!\nNomi: {name}\nID: {tid}\n"
+                "Turnirlar menyusidan istalgan vaqtda boshlashingiz mumkin.",
+                buttons([
+                    [{"text": "🏆 Turnirlar", "callback_data": "t:list"}]
+                ])
             )
 
-        states.pop(ADMIN_ID, None)
-        return
 
-    # Cancel pending user answer.
-    if text == "/bekor":
-        if user_id in states:
-            states.pop(user_id, None)
-            send_message(chat_id, "❌ Amal bekor qilindi.")
-        return
+# ========== TURNIRLARNI KO'RISH VA BOSHLASH ==========
+def list_tournaments(chat_id):
+    with connect() as c:
+        tournaments = c.execute(
+            "SELECT * FROM tournaments ORDER BY id DESC"
+        ).fetchall()
 
-    # Answer flow.
-    if process_user_answer(message):
-        return
+    rows = []
+    lines = ["🏆 SAQLANGAN TURNIRLAR\n"]
 
-    # Start command.
-    if text == "/start":
-        send_message(
-            chat_id,
-            "<b>👋 Assalomu alaykum!</b>\n\n"
-            "🧠 <b>Algoritm Zakovat</b> botiga xush kelibsiz!\n\n"
-            "Savollarda qatnashing va bilimingizni sinang.\n"
-            "🏆 To‘g‘ri javoblar uchun ball to‘plang.\n\n"
-            "👤 /profil — profilingiz\n"
-            "🔒 Reyting faqat admin uchun ochiq.\n\n"
-            "📩 Savol yoki taklif bo‘lsa, adminga yozing.",
-            [[{
-                "text": "📩 Adminga murojaat",
-                "callback_data": "contact_admin"
-            }]]
+    for t in tournaments:
+        with connect() as c:
+            count = c.execute(
+                "SELECT COUNT(*) FROM tournament_questions WHERE tournament_id=?",
+                (t["id"],)
+            ).fetchone()[0]
+
+        lines.append(
+            f"#{t['id']} — {t['name']} | {count} ta savol | {t['status']}"
         )
-        return
 
-    if text == "/profil":
-        show_profile(chat_id, user_id)
-        return
+        if t["status"] == "ready" and count > 0:
+            rows.append([{
+                "text": f"▶️ Boshlash: #{t['id']} {t['name'][:20]}",
+                "callback_data": f"t:start:{t['id']}"
+            }])
 
-    if text == "/reyting":
-        if user_id == ADMIN_ID:
-            show_rating(chat_id)
+    rows.append([{"text": "➕ Turnir yaratish", "callback_data": "t:new"}])
+    rows.append([{"text": "⬅️ Admin panel", "callback_data": "admin"}])
+
+    send(chat_id, "\n".join(lines), buttons(rows))
+
+
+def start_tournament(tid):
+    with connect() as c:
+        active = c.execute(
+            "SELECT id FROM tournaments WHERE status='running'"
+        ).fetchone()
+
+        if active:
+            send(ADMIN_ID, "❗ Avval davom etayotgan turnir tugashini kuting.")
+            return
+
+        t = c.execute(
+            "SELECT * FROM tournaments WHERE id=?",
+            (tid,)
+        ).fetchone()
+
+        if not t or t["status"] != "ready":
+            send(ADMIN_ID, "Turnir topilmadi yoki uni boshlash mumkin emas.")
+            return
+
+        q = c.execute("""
+            SELECT * FROM tournament_questions
+            WHERE tournament_id=?
+            ORDER BY number LIMIT 1
+        """, (tid,)).fetchone()
+
+        if not q:
+            send(ADMIN_ID, "Turnirda savollar yo'q.")
+            return
+
+        c.execute(
+            "UPDATE tournaments SET status='running',current_number=0 WHERE id=?",
+            (tid,)
+        )
+
+    publish_tournament_question(q["id"])
+
+
+def publish_tournament_question(qid):
+    with connect() as c:
+        q = c.execute(
+            "SELECT * FROM tournament_questions WHERE id=?",
+            (qid,)
+        ).fetchone()
+
+        t = c.execute(
+            "SELECT * FROM tournaments WHERE id=?",
+            (q["tournament_id"],)
+        ).fetchone()
+
+        deadline = time.time() + q["duration"]
+
+        c.execute("""
+            UPDATE tournament_questions
+            SET status='active',deadline=?
+            WHERE id=?
+        """, (deadline, qid))
+
+        c.execute(
+            "UPDATE tournaments SET current_number=? WHERE id=?",
+            (q["number"], q["tournament_id"])
+        )
+
+    message = (
+        f"🏆 {t['name']}\n"
+        f"🧠 {q['number']}-savol\n\n"
+        f"{q['question']}\n\n"
+        f"⏱ Vaqt: {q['duration']} soniya"
+    )
+
+    result = send(
+        CHANNEL_ID,
+        message,
+        buttons([[
+            {
+                "text": "✍️ Javob berish",
+                "url": bot_link(f"ta_{qid}")
+            }
+        ]])
+    )
+
+    send(
+        ADMIN_ID,
+        f"▶️ Turnir boshlandi: {t['name']}\n"
+        f"{q['number']}-savol, vaqt: {q['duration']} soniya."
+    )
+
+
+# ========== TURNIR JAVOBLARI ==========
+def submit_tournament_answer(user_id, qid, text):
+    with connect() as c:
+        q = c.execute(
+            "SELECT * FROM tournament_questions WHERE id=?",
+            (qid,)
+        ).fetchone()
+
+        if not q or q["status"] != "active" or time.time() > q["deadline"]:
+            send(user_id, "⏰ Javob berish vaqti tugagan.")
+            return
+
+        t = c.execute(
+            "SELECT * FROM tournaments WHERE id=?",
+            (q["tournament_id"],)
+        ).fetchone()
+
+        if not t or t["status"] != "running":
+            send(user_id, "Turnir hozir faol emas.")
+            return
+
+        try:
+            c.execute("""
+                INSERT INTO tournament_answers(question_id,user_id,answer)
+                VALUES(?,?,?)
+            """, (qid, user_id, text))
+        except sqlite3.IntegrityError:
+            send(user_id, "Siz bu savolga allaqachon javob yuborgansiz.")
+            return
+
+        aid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    send(user_id, "📩 Javobingiz qabul qilindi. Ballni admin belgilaydi.")
+
+    send(
+        ADMIN_ID,
+        f"📨 TURNIR JAVOBI\n\n"
+        f"Turnir: {t['name']}\n"
+        f"Savol: {q['number']}\n"
+        f"Ishtirokchi: {member_name(user_id)}\n"
+        f"Telegram ID: {user_id}\n"
+        f"Javob: {text}",
+        buttons([[
+            {"text": "➕ +1", "callback_data": f"score:t:{aid}:1"},
+            {"text": "➖ −1", "callback_data": f"score:t:{aid}:-1"},
+            {"text": "0 ball", "callback_data": f"score:t:{aid}:0"}
+        ]])
+    )
+
+
+def review_tournament_answer(aid, points):
+    with connect() as c:
+        a = c.execute(
+            "SELECT * FROM tournament_answers WHERE id=?",
+            (aid,)
+        ).fetchone()
+
+        if not a:
+            return "Javob topilmadi."
+
+        old = a["points_awarded"]
+        delta = points - old
+
+        c.execute(
+            "UPDATE tournament_answers SET points_awarded=?,reviewed=1 WHERE id=?",
+            (points, aid)
+        )
+
+    if delta:
+        add_points(a["user_id"], delta, f"Turnir javobi #{aid}")
+
+    return f"{member_name(a['user_id'])}: {old:+d} → {points:+d} ball."
+
+
+# ========== SAVOL VAQTI TUGASHI ==========
+def check_expired_questions():
+    current = time.time()
+
+    with connect() as c:
+        expired = c.execute("""
+            SELECT * FROM tournament_questions
+            WHERE status='active' AND deadline<=?
+        """, (current,)).fetchall()
+
+    for q in expired:
+        with connect() as c:
+            c.execute(
+                "UPDATE tournament_questions SET status='closed' WHERE id=?",
+                (q["id"],)
+            )
+            t = c.execute(
+                "SELECT * FROM tournaments WHERE id=?",
+                (q["tournament_id"],)
+            ).fetchone()
+
+            nxt = c.execute("""
+                SELECT * FROM tournament_questions
+                WHERE tournament_id=? AND number>?
+                ORDER BY number LIMIT 1
+            """, (q["tournament_id"], q["number"])).fetchone()
+
+        send(
+            CHANNEL_ID,
+            f"⏰ {t['name']} — {q['number']}-savol yopildi!\n"
+            f"Javob: {q['answer']}"
+        )
+
+        if nxt:
+            publish_tournament_question(nxt["id"])
         else:
-            send_message(chat_id, "🔒 Reyting faqat admin uchun ochiq.")
+            finish_tournament(t["id"])
+
+
+# ========== TURNIR HISOBOTI ==========
+def finish_tournament(tid):
+    with connect() as c:
+        t = c.execute(
+            "SELECT * FROM tournaments WHERE id=?",
+            (tid,)
+        ).fetchone()
+
+        c.execute(
+            "UPDATE tournaments SET status='finished' WHERE id=?",
+            (tid,)
+        )
+
+        questions = c.execute("""
+            SELECT * FROM tournament_questions
+            WHERE tournament_id=? ORDER BY number
+        """, (tid,)).fetchall()
+
+    report = [f"🏁 TURNIR YAKUNLANDI: {t['name']}", ""]
+
+    with connect() as c:
+        ranking = c.execute("""
+            SELECT s.user_id,s.points
+            FROM scores s
+            JOIN (
+                SELECT DISTINCT ta.user_id
+                FROM tournament_answers ta
+                JOIN tournament_questions tq ON tq.id=ta.question_id
+                WHERE tq.tournament_id=?
+            ) participants ON participants.user_id=s.user_id
+            ORDER BY s.points DESC
+        """, (tid,)).fetchall()
+
+    report.append("🏅 Reyting:")
+    for i, r in enumerate(ranking, 1):
+        report.append(f"{i}. {member_name(r['user_id'])} — {r['points']} umumiy ball")
+
+    report.append("\n📋 Batafsil javoblar:")
+
+    for q in questions:
+        report.append(
+            f"\n{q['number']}-savol: {q['question']}\n"
+            f"To'g'ri javob: {q['answer']}"
+        )
+
+        with connect() as c:
+            answers = c.execute("""
+                SELECT * FROM tournament_answers
+                WHERE question_id=? ORDER BY id
+            """, (q["id"],)).fetchall()
+
+        if not answers:
+            report.append("Javob bo'lmadi.")
+
+        for a in answers:
+            report.append(
+                f"• {member_name(a['user_id'])}: {a['answer']} "
+                f"| {a['points_awarded']:+d} ball"
+            )
+
+    full = "\n".join(report)
+
+    # Telegram xabar uzunligini cheklash uchun hisobotni bo'lib yuborish.
+    for i in range(0, len(full), 3500):
+        send(ADMIN_ID, full[i:i + 3500])
+
+    send(CHANNEL_ID, f"🏆 {t['name']} turniri yakunlandi! Ishtirokchilarga rahmat.")
+
+
+# ========== CALLBACKLAR ==========
+def callback_handler(cb):
+    data = cb.get("data", "")
+    uid = cb["from"]["id"]
+    chat_id = cb["message"]["chat"]["id"]
+    callback_id = cb["id"]
+
+    api("answerCallbackQuery", {"callback_query_id": callback_id})
+
+    if admin(uid):
+        if data == "admin":
+            show_admin(chat_id)
+
+        elif data == "t:list":
+            list_tournaments(chat_id)
+
+        elif data == "t:new":
+            create_tournament(uid)
+
+        elif data.startswith("t:start:"):
+            start_tournament(int(data.split(":")[2]))
+
+        elif data == "q:new":
+            states[uid] = {"mode": "q_text"}
+            send(uid, "Oddiy savol matnini yuboring.")
+
+        elif data.startswith("score:t:"):
+            _, _, aid, points = data.split(":")
+            result = review_tournament_answer(int(aid), int(points))
+            send(ADMIN_ID, "✅ " + result)
+
+        elif data == "rating":
+            with connect() as c:
+                rows = c.execute(
+                    "SELECT user_id,points FROM scores ORDER BY points DESC LIMIT 20"
+                ).fetchall()
+
+            lines = ["🏅 REYTING"]
+            for i, r in enumerate(rows, 1):
+                lines.append(
+                    f"{i}. {member_name(r['user_id'])} — {r['points']} ball"
+                )
+            send(chat_id, "\n".join(lines))
+
+        elif data == "members":
+            with connect() as c:
+                n = c.execute("SELECT COUNT(*) FROM members").fetchone()[0]
+            send(chat_id, f"👥 Botdagi a'zolar: {n}")
+
+        elif data == "stats":
+            with connect() as c:
+                members = c.execute("SELECT COUNT(*) FROM members").fetchone()[0]
+                tournaments = c.execute("SELECT COUNT(*) FROM tournaments").fetchone()[0]
+                answers = c.execute("SELECT COUNT(*) FROM tournament_answers").fetchone()[0]
+            send(chat_id, f"📊 Statistika\nA'zolar: {members}\nTurnirlar: {tournaments}\nTurnir javoblari: {answers}")
+
+        elif data == "broadcast":
+            states[uid] = {"mode": "broadcast"}
+            send(uid, "Barcha a'zolarga yuboriladigan xabarni kiriting.")
+
+    else:
+        if data == "user:rating":
+            with connect() as c:
+                rows = c.execute(
+                    "SELECT user_id,points FROM scores ORDER BY points DESC LIMIT 10"
+                ).fetchall()
+            lines = ["🏅 TOP-10"]
+            for i, r in enumerate(rows, 1):
+                lines.append(f"{i}. {member_name(r['user_id'])} — {r['points']}")
+            send(chat_id, "\n".join(lines))
+
+
+# ========== XABARLARNI QABUL QILISH ==========
+def message_handler(message):
+    user = message.get("from", {})
+    uid = user.get("id")
+    chat_id = message["chat"]["id"]
+    text = (message.get("text") or "").strip()
+
+    if not uid or not text:
+        return
+
+    save_member(user)
+
+    if text == "/cancel":
+        states.pop(uid, None)
+        send(chat_id, "Amal bekor qilindi.")
+        return
+
+    if text.startswith("/start"):
+        payload = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else ""
+
+        if payload.startswith("ta_"):
+            try:
+                qid = int(payload[3:])
+            except ValueError:
+                send(chat_id, "Savol havolasi noto'g'ri.")
+                return
+
+            with connect() as c:
+                q = c.execute(
+                    "SELECT * FROM tournament_questions WHERE id=?",
+                    (qid,)
+                ).fetchone()
+
+            if not q or q["status"] != "active" or time.time() > q["deadline"]:
+                send(chat_id, "⏰ Bu savol uchun vaqt tugagan.")
+                return
+
+            states[uid] = {"mode": "answer_tournament", "qid": qid}
+            send(chat_id, f"🧠 Savol:\n{q['question']}\n\nJavobingizni yuboring.")
+            return
+
+        if admin(uid):
+            show_admin(chat_id)
+        else:
+            send(
+                chat_id,
+                "Xush kelibsiz! ALGORITM Zakovat botiga xush kelibsiz.",
+                buttons([[
+                    {"text": "🏅 Reyting", "callback_data": "user:rating"}
+                ]])
+            )
         return
 
     if text == "/admin":
-        if user_id == ADMIN_ID:
+        if admin(uid):
             show_admin(chat_id)
         else:
-            send_message(chat_id, "❌ Siz admin emassiz.")
+            send(chat_id, "Bu buyruq faqat admin uchun.")
         return
 
-    # All commands below are admin-only.
-    if user_id == ADMIN_ID:
-        if text == "/javoblar":
-            show_answers(chat_id)
-            return
+    st = states.get(uid, {})
+    mode = st.get("mode")
 
-        if text == "/a'zolar":
-            show_members(chat_id)
-            return
+    if mode and mode.startswith("t_"):
+        tournament_input(uid, text)
+        return
 
-        if text == "/statistika":
-            show_stats(chat_id)
-            return
+    if mode == "answer_tournament":
+        qid = st["qid"]
+        states.pop(uid, None)
+        submit_tournament_answer(uid, qid, text)
+        return
 
-        if text == "/tarix":
-            show_history(chat_id)
-            return
+    if admin(uid):
+        if mode == "q_text":
+            st["question"] = text
+            st["mode"] = "q_answer"
+            send(uid, "To'g'ri javobni yuboring.")
 
-        if text == "/vaqt":
-            show_time_menu(chat_id)
-            return
+        elif mode == "q_answer":
+            st["answer"] = text
+            st["mode"] = "q_duration"
+            send(uid, "Vaqtni soniyada yuboring. Masalan, 900 = 15 daqiqa.")
 
-        state = states.get(ADMIN_ID)
+        elif mode == "q_duration":
+            try:
+                duration = int(text)
+                if duration < 10:
+                    raise ValueError
+            except ValueError:
+                send(uid, "Kamida 10 soniya kiriting.")
+                return
 
-        if state and state.get("state") == "broadcast":
-            do_broadcast(chat_id, text)
-            states.pop(ADMIN_ID, None)
-            return
+            with connect() as c:
+                c.execute("""
+                    INSERT INTO questions(question,answer,duration,status)
+                    VALUES(?,?,?,'active')
+                """, (st["question"], st["answer"], duration))
+                qid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+                c.execute(
+                    "UPDATE questions SET deadline=? WHERE id=?",
+                    (time.time() + duration, qid)
+                )
 
-        if state and state.get("state") in ("question", "answer", "variants"):
-            process_question(chat_id, text)
-            return
-
-
-# ============================================================
-# CLOSE EXPIRED QUESTIONS
-# ============================================================
-
-def check_expired_questions():
-    rows = db.execute("""
-        SELECT id, start_time, duration
-        FROM questions WHERE active=1
-    """).fetchall()
-
-    for row in rows:
-        if now() >= row["start_time"] + row["duration"]:
-            db.execute(
-                "UPDATE questions SET active=0 WHERE id=?",
-                (row["id"],)
+            states.pop(uid, None)
+            send(
+                CHANNEL_ID,
+                f"🧠 ALGORITM ZAKOVAT\n\n{st['question']}\n\n"
+                f"⏱ Vaqt: {duration} soniya",
+                buttons([[
+                    {"text": "✍️ Javob berish", "url": bot_link(f"qa_{qid}")}
+                ]])
             )
-            db.commit()
-            send_message(
-                ADMIN_ID,
-                f"⏰ <b>#{row['id']}</b>-savol vaqti tugadi."
-            )
+            send(uid, "✅ Oddiy savol kanalga yuborildi.")
+        elif mode == "broadcast":
+            states.pop(uid, None)
+            with connect() as c:
+                users = c.execute("SELECT user_id FROM members").fetchall()
+
+            sent = 0
+            for row in users:
+                if send(row["user_id"], text).get("ok"):
+                    sent += 1
+                time.sleep(0.05)
+
+            send(uid, f"📣 Xabar yuborildi: {sent}/{len(users)}")
+        else:
+            show_admin(uid)
+
+    else:
+        send(chat_id, "Savolga javob berish uchun kanal postidagi tugmani bosing.")
 
 
-# ============================================================
-# MAIN LOOP
-# ============================================================
-
+# ========== ISHGA TUSHIRISH ==========
 def main():
-    print("🤖 ALGORITM ZAKOVAT BOT ISHGA TUSHDI")
+    global offset, BOT_USERNAME
 
-    tg("deleteWebhook", {"drop_pending_updates": True})
+    if not TOKEN:
+        print("BOT_TOKEN sozlanmagan. Hosting Secrets bo'limiga kiriting.")
+        return
 
-    offset = 0
-    last_check = 0
+    init_db()
+    api("deleteWebhook", {"drop_pending_updates": False})
+
+    me = api("getMe")
+    if not me.get("ok"):
+        print("Token xato yoki Telegram API bilan aloqa yo'q.")
+        return
+
+    BOT_USERNAME = me["result"]["username"]
+    send(ADMIN_ID, "✅ ALGORITM Zakovat ishga tushdi.\nAdmin panel: /admin")
+
+    print(f"Bot ishga tushdi: @{BOT_USERNAME}")
 
     while True:
         try:
-            result = tg(
-                "getUpdates",
-                {
-                    "offset": offset,
-                    "timeout": 30,
-                    "allowed_updates": ["message", "callback_query"]
-                }
-            )
+            result = api("getUpdates", {
+                "offset": offset,
+                "timeout": 25,
+                "allowed_updates": ["message", "callback_query"]
+            })
 
-            if not result.get("ok"):
-                time.sleep(5)
-                continue
+            if result.get("ok"):
+                for update in result.get("result", []):
+                    offset = update["update_id"] + 1
 
-            for update in result.get("result", []):
-                offset = update["update_id"] + 1
-
-                try:
                     if "message" in update:
-                        handle_message(update["message"])
+                        message_handler(update["message"])
+
                     elif "callback_query" in update:
-                        handle_callback(update["callback_query"])
-                except Exception as e:
-                    print("UPDATE ERROR:", e)
+                        callback_handler(update["callback_query"])
 
-            if now() - last_check >= 20:
-                check_expired_questions()
-                last_check = now()
+            check_expired_questions()
 
+        except KeyboardInterrupt:
+            break
         except Exception as e:
-            print("MAIN LOOP ERROR:", e)
-            time.sleep(5)
+            log.exception("Xatolik: %s", e)
+            time.sleep(3)
 
 
 if __name__ == "__main__":
