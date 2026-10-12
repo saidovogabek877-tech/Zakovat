@@ -586,5 +586,5 @@ def main():
                 check_expired_questions(); check_tournament_timers(); last_check=now()
         except KeyboardInterrupt: break
         except Exception as e: print('MAIN LOOP ERROR:',repr(e)); time.sleep(3)
-            if __name__=='__main__': main()
-            
+
+if __name__=='__main__': main()
