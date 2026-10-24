@@ -1,10 +1,12 @@
+
 import os
 import time
 import sqlite3
 import logging
 import requests
 
-# ===== SOZLAMALAR =====
+# ============== SOZLAMALAR ==============
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = 5607350126
 DB_FILE = "bot_data.db"
@@ -16,21 +18,21 @@ logging.basicConfig(
 )
 
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN topilmadi. Hostingdagi Secrets/Environment Variables "
-        "bo'limiga BOT_TOKEN qo'shing."
-    )
+    raise RuntimeError("BOT_TOKEN hosting sozlamalarida mavjud emas.")
 
+# ============== TELEGRAM API ==============
 
-# ===== TELEGRAM API =====
 def tg(method, data=None, timeout=40):
     try:
-        response = requests.post(
+        r = requests.post(
             f"{API_URL}/{method}",
             json=data or {},
             timeout=timeout
         )
-        return response.json()
+        result = r.json()
+        if not result.get("ok"):
+            logging.error("%s: %s", method, result.get("description"))
+        return result
     except Exception:
         logging.exception("Telegram API xatosi")
         return {"ok": False}
@@ -44,7 +46,8 @@ def send(chat_id, text, **kwargs):
     })
 
 
-# ===== BAZA =====
+# ============== MA'LUMOTLAR BAZASI ==============
+
 def db():
     conn = sqlite3.connect(DB_FILE, timeout=20)
     conn.row_factory = sqlite3.Row
@@ -71,14 +74,34 @@ def init_db():
                 user_id INTEGER NOT NULL
             )
         """)
-        conn.commit()
+
+        # Eski bazada ustun yetishmasa, avtomatik qo'shish.
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(users)")
+        }
+
+        migrations = {
+            "username": "TEXT DEFAULT ''",
+            "first_name": "TEXT DEFAULT ''",
+            "last_name": "TEXT DEFAULT ''",
+            "course": "TEXT DEFAULT ''",
+            "group_name": "TEXT DEFAULT ''",
+            "step": "TEXT DEFAULT 'name'",
+            "registered": "INTEGER DEFAULT 0"
+        }
+
+        for column, definition in migrations.items():
+            if column not in columns:
+                conn.execute(
+                    f"ALTER TABLE users ADD COLUMN {column} {definition}"
+                )
 
 
 def get_user(user_id):
     with db() as conn:
         return conn.execute(
-            "SELECT * FROM users WHERE user_id = ?",
-            (user_id,)
+            "SELECT * FROM users WHERE user_id = ?", (user_id,)
         ).fetchone()
 
 
@@ -95,12 +118,9 @@ def set_field(user_id, field, value):
             f"UPDATE users SET {field} = ? WHERE user_id = ?",
             (value, user_id)
         )
-        conn.commit()
 
 
 def ensure_user(tg_user):
-    user_id = tg_user["id"]
-
     with db() as conn:
         conn.execute("""
             INSERT INTO users (user_id, username, first_name)
@@ -108,20 +128,19 @@ def ensure_user(tg_user):
             ON CONFLICT(user_id) DO UPDATE SET
                 username = excluded.username
         """, (
-            user_id,
+            tg_user["id"],
             tg_user.get("username") or "",
             tg_user.get("first_name") or ""
         ))
-        conn.commit()
 
 
 def save_reply_map(message_id, user_id):
     with db() as conn:
-        conn.execute("""
-            INSERT OR REPLACE INTO reply_map (message_id, user_id)
-            VALUES (?, ?)
-        """, (message_id, user_id))
-        conn.commit()
+        conn.execute(
+            "INSERT OR REPLACE INTO reply_map (message_id, user_id) "
+            "VALUES (?, ?)",
+            (message_id, user_id)
+        )
 
 
 def find_reply_user(message_id):
@@ -130,38 +149,42 @@ def find_reply_user(message_id):
             "SELECT user_id FROM reply_map WHERE message_id = ?",
             (message_id,)
         ).fetchone()
-
     return row["user_id"] if row else None
 
 
-# ===== RO'YXATDAN O'TISH =====
+# ============== RO'YXATDAN O'TISH ==============
+
 def ask(chat_id, step):
     prompts = {
         "name": (
             "Assalomu alaykum! 👋\n\n"
-            "Botimizga xush kelibsiz!\n"
-            "Ismingizni yozing:"
+            "Xush kelibsiz!\n"
+            "Botdan qulay foydalanishingiz uchun qisqa "
+            "ro'yxatdan o'tamiz.\n\n"
+            "✍️ Ismingizni kiriting:"
         ),
-        "last_name": "Rahmat! Endi familiyangizni yozing:",
+        "last_name": (
+            "Rahmat! 😊\n\n"
+            "Endi familiyangizni kiriting:"
+        ),
         "course": (
-            "Kursingizni yozing.\n"
+            "🎓 Qaysi kursda tahsil olasiz?\n\n"
             "Masalan: 1-kurs.\n"
-            "Agar kursga tegishli bo'lmasangiz, «Yo‘q» deb yozing:"
+            "Agar talaba bo'lmasangiz, «Yo'q» deb yozing."
         ),
         "group_name": (
-            "Guruhingizni yozing.\n"
+            "📚 Guruhingiz nomini kiriting.\n\n"
             "Masalan: KI-26.03.\n"
-            "Guruhingiz bo'lmasa, «Yo‘q» deb yozing:"
+            "Guruhingiz bo'lmasa, «Yo'q» deb yozing."
         )
     }
-
     send(chat_id, prompts.get(step, prompts["name"]))
 
 
 def full_name(user):
     return (
         f"{user['first_name']} {user['last_name']}"
-    ).strip() or "Kiritilmagan"
+    ).strip() or "Ko'rsatilmagan"
 
 
 def finish_registration(chat_id, user_id):
@@ -169,27 +192,24 @@ def finish_registration(chat_id, user_id):
     set_field(user_id, "step", "done")
 
     user = get_user(user_id)
-    username = (
-        f"@{user['username']}"
-        if user["username"]
-        else "Mavjud emas"
-    )
+    username = f"@{user['username']}" if user["username"] else "Mavjud emas"
 
     send(
         chat_id,
-        "✅ Ro'yxatdan o'tish yakunlandi!\n\n"
+        "🎉 Ro'yxatdan muvaffaqiyatli o'tdingiz!\n\n"
         f"👤 Ism-familiya: {full_name(user)}\n"
-        f"🎓 Kurs: {user['course'] or 'Kiritilmagan'}\n"
-        f"👥 Guruh: {user['group_name'] or 'Kiritilmagan'}\n\n"
-        "Endi bemalol xabar yuborishingiz mumkin. 💬"
+        f"🎓 Kurs: {user['course'] or 'Ko'rsatilmagan'}\n"
+        f"👥 Guruh: {user['group_name'] or 'Ko'rsatilmagan'}\n\n"
+        "Endi botdan bemalol foydalanishingiz mumkin. 💬\n"
+        "Savol yoki murojaatingiz bo'lsa, xabaringizni yuboring."
     )
 
     send(
         ADMIN_ID,
-        "🆕 YANGI FOYDALANUVCHI\n\n"
+        "🆕 YANGI FOYDALANUVCHI RO'YXATDAN O'TDI\n\n"
         f"👤 Ism-familiya: {full_name(user)}\n"
-        f"🎓 Kurs: {user['course'] or 'Kiritilmagan'}\n"
-        f"👥 Guruh: {user['group_name'] or 'Kiritilmagan'}\n"
+        f"🎓 Kurs: {user['course'] or 'Ko'rsatilmagan'}\n"
+        f"👥 Guruh: {user['group_name'] or 'Ko'rsatilmagan'}\n"
         f"🔗 Username: {username}\n"
         f"🆔 Telegram ID: {user_id}"
     )
@@ -201,7 +221,7 @@ def registration_step(message, user):
     text = (message.get("text") or "").strip()
 
     if not text:
-        send(chat_id, "Iltimos, matn ko'rinishida javob yozing.")
+        send(chat_id, "Iltimos, javobingizni matn ko'rinishida yuboring.")
         return
 
     step = user["step"]
@@ -220,7 +240,6 @@ def registration_step(message, user):
         value = "" if text.lower() in {
             "yo'q", "yo‘q", "yoq", "-", "нет"
         } else text[:100]
-
         set_field(user_id, "course", value)
         set_field(user_id, "step", "group_name")
         ask(chat_id, "group_name")
@@ -229,40 +248,31 @@ def registration_step(message, user):
         value = "" if text.lower() in {
             "yo'q", "yo‘q", "yoq", "-", "нет"
         } else text[:100]
-
         set_field(user_id, "group_name", value)
         finish_registration(chat_id, user_id)
 
 
-# ===== FOYDALANUVCHI XABARINI ADGINGA YUBORISH =====
+# ============== FOYDALANUVCHI XABARI ==============
+
 def forward_to_admin(message, user):
     user_id = user["user_id"]
-
-    username = (
-        f"@{user['username']}"
-        if user["username"]
-        else "Mavjud emas"
-    )
+    username = f"@{user['username']}" if user["username"] else "Mavjud emas"
 
     info = (
-        "📩 YANGI XABAR\n\n"
-        f"👤 Ism: {user['first_name'] or 'Kiritilmagan'}\n"
-        f"📝 Familiya: {user['last_name'] or 'Kiritilmagan'}\n"
-        f"🎓 Kurs: {user['course'] or 'Kiritilmagan'}\n"
-        f"👥 Guruh: {user['group_name'] or 'Kiritilmagan'}\n"
+        "📩 FOYDALANUVCHIDAN YANGI MUROJAAT\n\n"
+        f"👤 Ism: {user['first_name'] or 'Ko'rsatilmagan'}\n"
+        f"📝 Familiya: {user['last_name'] or 'Ko'rsatilmagan'}\n"
+        f"🎓 Kurs: {user['course'] or 'Ko'rsatilmagan'}\n"
+        f"👥 Guruh: {user['group_name'] or 'Ko'rsatilmagan'}\n"
         f"🔗 Username: {username}\n"
         f"🆔 Telegram ID: {user_id}\n\n"
-        "⬇️ Foydalanuvchi xabari quyida.\n"
-        "Javob berish uchun shu xabarga Reply qiling."
+        "💬 Foydalanuvchi yuborgan xabar quyida.\n"
+        "↩️ Javob berish uchun xabar nusxasiga Reply qiling."
     )
 
     info_result = send(ADMIN_ID, info)
-
     if info_result.get("ok"):
-        save_reply_map(
-            info_result["result"]["message_id"],
-            user_id
-        )
+        save_reply_map(info_result["result"]["message_id"], user_id)
 
     copied = tg("copyMessage", {
         "chat_id": ADMIN_ID,
@@ -271,13 +281,13 @@ def forward_to_admin(message, user):
     })
 
     if copied.get("ok"):
-        save_reply_map(
-            copied["result"]["message_id"],
-            user_id
-        )
+        save_reply_map(copied["result"]["message_id"], user_id)
+    else:
+        logging.error("Foydalanuvchi xabarini adminga nusxalab bo'lmadi.")
 
 
-# ===== ADMIN JAVOBI =====
+# ============== ADMIN JAVOBI ==============
+
 def admin_reply(message):
     reply = message.get("reply_to_message")
 
@@ -285,7 +295,7 @@ def admin_reply(message):
         send(
             ADMIN_ID,
             "Foydalanuvchiga javob berish uchun uning "
-            "ma'lumot xabariga yoki xabari nusxasiga Reply qiling."
+            "xabar nusxasiga Reply qiling."
         )
         return
 
@@ -295,14 +305,15 @@ def admin_reply(message):
         send(
             ADMIN_ID,
             "Foydalanuvchi aniqlanmadi. Bot yuborgan "
-            "ma'lumot xabariga Reply qiling."
+            "murojaat xabariga Reply qiling."
         )
         return
 
     if message.get("text"):
         result = send(
             user_id,
-            "📩 Admin javobi:\n\n" + message["text"]
+            "📩 Sizga admin tomonidan javob keldi:\n\n"
+            + message["text"]
         )
     else:
         result = tg("copyMessage", {
@@ -312,52 +323,52 @@ def admin_reply(message):
         })
 
     if result.get("ok"):
-        send(ADMIN_ID, "✅ Javob foydalanuvchiga yuborildi.")
+        send(ADMIN_ID, "✅ Javob foydalanuvchiga muvaffaqiyatli yuborildi.")
     else:
         send(
             ADMIN_ID,
-            "❌ Xabar yuborilmadi. Foydalanuvchi botni "
-            "bloklagan bo'lishi mumkin."
+            "❌ Javob yuborilmadi. Foydalanuvchi botni bloklagan "
+            "yoki bot bilan hali shaxsiy chatni boshlamagan bo'lishi mumkin."
         )
 
 
-# ===== XABARLARNI QAYTA ISHLASH =====
+# ============== XABARLARNI QAYTA ISHLASH ==============
+
 def handle_message(message):
     sender = message.get("from")
-
     if not sender or sender.get("is_bot"):
         return
 
-    if message["chat"].get("type") != "private":
+    if message.get("chat", {}).get("type") != "private":
         return
 
     user_id = sender["id"]
     chat_id = message["chat"]["id"]
-    text = message.get("text") or ""
+    text = (message.get("text") or "").strip()
 
     # ADMIN
     if user_id == ADMIN_ID:
-        if text.startswith("/start"):
+        if text == "/start":
             send(
                 ADMIN_ID,
-                "👋 Admin paneli.\n\n"
-                "Foydalanuvchi xabariga Reply qilib javob yuboring.\n"
+                "👋 Admin paneliga xush kelibsiz!\n\n"
+                "📨 Foydalanuvchi xabariga Reply qilib javob yuboring.\n"
                 "/users — foydalanuvchilar statistikasi"
             )
             return
 
-        if text.startswith("/users"):
+        if text == "/users":
             with db() as conn:
                 total = conn.execute(
                     "SELECT COUNT(*) AS n FROM users"
                 ).fetchone()["n"]
-
                 registered = conn.execute(
                     "SELECT COUNT(*) AS n FROM users WHERE registered = 1"
                 ).fetchone()["n"]
 
             send(
                 ADMIN_ID,
+                "📊 FOYDALANUVCHILAR STATISTIKASI\n\n"
                 f"👥 Jami foydalanuvchilar: {total}\n"
                 f"✅ Ro'yxatdan o'tganlar: {registered}"
             )
@@ -370,13 +381,13 @@ def handle_message(message):
     ensure_user(sender)
     user = get_user(user_id)
 
-    if text.startswith("/start"):
+    if text == "/start":
         if user["registered"]:
             send(
                 chat_id,
                 "Assalomu alaykum! 👋\n\n"
-                "Siz ro'yxatdan o'tgansiz.\n"
-                "Bemalol xabar yuborishingiz mumkin."
+                "Xush kelibsiz! Siz ro'yxatdan o'tgansiz.\n"
+                "Murojaatingizni yuborishingiz mumkin. 💬"
             )
         else:
             ask(chat_id, user["step"])
@@ -387,27 +398,28 @@ def handle_message(message):
         return
 
     forward_to_admin(message, user)
-    send(chat_id, "✅ Xabaringiz adminga yuborildi. Rahmat!")
+
+    send(
+        chat_id,
+        "✅ Xabaringiz adminga yetkazildi!\n\n"
+        "Murojaatingiz uchun rahmat. 😊"
+    )
 
 
-# ===== BOT ISHGA TUSHISHI =====
+# ============== BOTNI ISHGA TUSHIRISH ==============
+
 def main():
     init_db()
 
-    # Webhook yoqilgan bo'lsa, polling ishlashi uchun o'chiradi.
-    tg("deleteWebhook", {"drop_pending_updates": False})
-
+    webhook = tg("deleteWebhook", {"drop_pending_updates": False})
     me = tg("getMe")
 
     if not me.get("ok"):
         raise RuntimeError(
-            "BOT_TOKEN noto'g'ri yoki Telegram API bilan ulanish imkonsiz."
+            "Bot tokeni noto'g'ri yoki Telegram bilan aloqa yo'q."
         )
 
-    logging.info(
-        "Bot ishga tushdi: @%s",
-        me["result"].get("username", "")
-    )
+    logging.info("Bot ishga tushdi: @%s", me["result"].get("username"))
 
     offset = None
 
@@ -417,7 +429,6 @@ def main():
                 "timeout": 30,
                 "allowed_updates": ["message"]
             }
-
             if offset is not None:
                 params["offset"] = offset
 
@@ -429,19 +440,15 @@ def main():
 
             for update in result.get("result", []):
                 offset = update["update_id"] + 1
-
                 if "message" in update:
                     try:
                         handle_message(update["message"])
                     except Exception:
-                        logging.exception(
-                            "Xabarni qayta ishlashda xato"
-                        )
+                        logging.exception("Xabarni qayta ishlashda xato")
 
         except KeyboardInterrupt:
             logging.info("Bot to'xtatildi.")
             break
-
         except Exception:
             logging.exception("Asosiy siklda xato")
             time.sleep(3)
