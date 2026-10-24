@@ -1,3 +1,4 @@
+
 import os
 import time
 import sqlite3
@@ -5,907 +6,751 @@ import logging
 import requests
 from datetime import datetime
 
-# ==================================================
-# SOZLAMALAR
-# ==================================================
+# ==================== SOZLAMALAR ====================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = 5607350126
-DB_FILE = "bot_data.db"
-
-if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN yo'q! Hosting Secrets bo'limiga BOT_TOKEN qo'shing."
-    )
-
-API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+DB_PATH = "zakovat.db"
+API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s"
 )
 
-http = requests.Session()
-db = sqlite3.connect(DB_FILE, check_same_thread=False)
-db.row_factory = sqlite3.Row
+session = requests.Session()
+broadcast_state = {}
 
-# Adminning ommaviy xabar yuborish holati
-broadcast_state = None
+# ==================== TELEGRAM API ====================
 
+def tg(method, data=None, files=None, timeout=40):
+    if not BOT_TOKEN:
+        logging.error("BOT_TOKEN sozlanmagan!")
+        return None
 
-# ==================================================
-# TELEGRAM API
-# ==================================================
-
-def tg(method, data=None, timeout=40):
     try:
-        response = http.post(
-            f"{API}/{method}",
-            json=data or {},
+        response = session.post(
+            f"{API_URL}/{method}",
+            data=data or {},
+            files=files,
             timeout=timeout
         )
         result = response.json()
 
         if not result.get("ok"):
             logging.error(
-                "Telegram %s xatosi: %s",
-                method,
-                result.get("description", result)
+                "Telegram API xatosi (%s): %s",
+                method, result.get("description")
             )
+            return None
 
-        return result
+        return result.get("result")
 
     except Exception:
-        logging.exception("Telegram API so'rovi bajarilmadi: %s", method)
-        return {"ok": False}
+        logging.exception("Telegram API bilan ulanishda xato")
+        return None
 
 
-def send(chat_id, text, **kwargs):
-    return tg("sendMessage", {
-        "chat_id": chat_id,
-        "text": text,
-        **kwargs
+def send_message(chat_id, text, reply_markup=None):
+    data = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        import json
+        data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+    return tg("sendMessage", data)
+
+
+def answer_callback(callback_id, text=""):
+    return tg("answerCallbackQuery", {
+        "callback_query_id": callback_id,
+        "text": text
     })
 
 
-def copy_message(chat_id, from_chat_id, message_id):
-    return tg("copyMessage", {
-        "chat_id": chat_id,
-        "from_chat_id": from_chat_id,
-        "message_id": message_id
-    })
+def keyboard(rows):
+    return {
+        "keyboard": rows,
+        "resize_keyboard": True
+    }
 
 
-def is_admin(user_id):
-    return int(user_id) == ADMIN_ID
+def inline_keyboard(rows):
+    return {"inline_keyboard": rows}
 
 
-# ==================================================
-# MA'LUMOTLAR BAZASI
-# ==================================================
+# ==================== MA'LUMOTLAR BAZASI ====================
 
-with db:
-    db.execute("""
+def db():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             first_name TEXT DEFAULT '',
             last_name TEXT DEFAULT '',
             course TEXT DEFAULT '',
             group_name TEXT DEFAULT '',
-            username TEXT DEFAULT '',
-            state TEXT DEFAULT 'first_name',
-            created_at TEXT DEFAULT '',
+            state TEXT DEFAULT 'ready',
+            registered_at TEXT DEFAULT '',
             blocked INTEGER DEFAULT 0
         )
     """)
 
-    db.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS message_map (
             admin_message_id INTEGER PRIMARY KEY,
             user_id INTEGER NOT NULL
         )
     """)
 
-    db.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS broadcast_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             sent_at TEXT,
-            total INTEGER,
-            delivered INTEGER,
-            failed INTEGER
+            sent_count INTEGER DEFAULT 0,
+            failed_count INTEGER DEFAULT 0
         )
     """)
 
-# Eski baza bilan moslik
-columns = {
-    row["name"]
-    for row in db.execute("PRAGMA table_info(users)").fetchall()
-}
+    # Eski bazada yetishmayotgan ustunlarni qo'shish.
+    cur.execute("PRAGMA table_info(users)")
+    columns = {row["name"] for row in cur.fetchall()}
 
-if "blocked" not in columns:
-    with db:
-        db.execute(
-            "ALTER TABLE users ADD COLUMN blocked INTEGER DEFAULT 0"
-        )
+    migrations = {
+        "first_name": "TEXT DEFAULT ''",
+        "last_name": "TEXT DEFAULT ''",
+        "course": "TEXT DEFAULT ''",
+        "group_name": "TEXT DEFAULT ''",
+        "state": "TEXT DEFAULT 'ready'",
+        "registered_at": "TEXT DEFAULT ''",
+        "blocked": "INTEGER DEFAULT 0"
+    }
+
+    for column, definition in migrations.items():
+        if column not in columns:
+            cur.execute(
+                f"ALTER TABLE users ADD COLUMN {column} {definition}"
+            )
+
+    conn.commit()
+    conn.close()
+    logging.info("Ma'lumotlar bazasi tayyor.")
 
 
 def get_user(user_id):
-    return db.execute(
-        "SELECT * FROM users WHERE user_id=?",
-        (user_id,)
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM users WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def save_user(user_id, **fields):
+    allowed = {
+        "first_name", "last_name", "course",
+        "group_name", "state", "registered_at", "blocked"
+    }
+
+    fields = {
+        key: value for key, value in fields.items()
+        if key in allowed
+    }
+
+    if not fields:
+        return
+
+    conn = db()
+    exists = conn.execute(
+        "SELECT user_id FROM users WHERE user_id = ?", (user_id,)
     ).fetchone()
 
-
-def add_user(user_id, username=""):
-    user = get_user(user_id)
-
-    if user is None:
-        with db:
-            db.execute("""
-                INSERT INTO users
-                (user_id, username, state, created_at, blocked)
-                VALUES (?, ?, 'first_name', ?, 0)
-            """, (
-                user_id,
-                username or "",
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            ))
+    if exists:
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        values = list(fields.values()) + [user_id]
+        conn.execute(
+            f"UPDATE users SET {assignments} WHERE user_id = ?", values
+        )
     else:
-        with db:
-            db.execute("""
-                UPDATE users
-                SET username=?, blocked=0
-                WHERE user_id=?
-            """, (username or "", user_id))
+        fields["user_id"] = user_id
+        columns = ", ".join(fields.keys())
+        placeholders = ", ".join("?" for _ in fields)
+        conn.execute(
+            f"INSERT INTO users ({columns}) VALUES ({placeholders})",
+            list(fields.values())
+        )
+
+    conn.commit()
+    conn.close()
 
 
 def set_state(user_id, state):
-    with db:
-        db.execute(
-            "UPDATE users SET state=? WHERE user_id=?",
-            (state, user_id)
-        )
+    save_user(user_id, state=state)
 
 
-def update_field(user_id, field, value):
-    allowed = {
-        "first_name", "last_name", "course", "group_name"
-    }
-
-    if field not in allowed:
-        return
-
-    with db:
-        db.execute(
-            f"UPDATE users SET {field}=? WHERE user_id=?",
-            (value.strip(), user_id)
-        )
+def all_users():
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM users ORDER BY registered_at DESC"
+    ).fetchall()
+    conn.close()
+    return rows
 
 
-def map_message(message_id, user_id):
-    with db:
-        db.execute("""
-            INSERT OR REPLACE INTO message_map
-            (admin_message_id, user_id)
-            VALUES (?, ?)
-        """, (message_id, user_id))
+# ==================== TUGMALAR ====================
+
+def user_menu():
+    return keyboard([
+        ["✏️ Ma'lumotlarim", "ℹ️ Yordam"],
+        ["📩 Adminga murojaat"]
+    ])
 
 
-def find_user_by_admin_message(message_id):
-    row = db.execute(
-        "SELECT user_id FROM message_map WHERE admin_message_id=?",
-        (message_id,)
-    ).fetchone()
-
-    return row["user_id"] if row else None
-
-
-def registered_users():
-    rows = db.execute("""
-        SELECT user_id FROM users
-        WHERE first_name != ''
-          AND last_name != ''
-          AND course != ''
-          AND group_name != ''
-    """).fetchall()
-
-    return [row["user_id"] for row in rows]
+def admin_menu():
+    return keyboard([
+        ["📊 Statistika", "👥 A'zolar"],
+        ["📢 Xabar yuborish", "📩 Murojaatlar"],
+        ["✏️ Ma'lumotlarim", "ℹ️ Yordam"]
+    ])
 
 
-# ==================================================
-# TUGMALAR
-# ==================================================
-
-def user_keyboard():
-    return {
-        "keyboard": [
-            [{"text": "✏️ Ma'lumotlarimni o'zgartirish"}],
-            [{"text": "ℹ️ Yordam"}]
-        ],
-        "resize_keyboard": True
-    }
-
-
-def admin_keyboard():
-    return {
-        "keyboard": [
-            [
-                {"text": "👥 Foydalanuvchilar"},
-                {"text": "📊 Statistika"}
-            ],
-            [
-                {"text": "📢 Hammaga xabar"},
-                {"text": "❌ Bekor qilish"}
-            ]
-        ],
-        "resize_keyboard": True
-    }
-
-
-# ==================================================
-# RO'YXATDAN O'TISH
-# ==================================================
-
-def next_registration_state(user):
-    if not user["first_name"]:
-        return "first_name"
-    if not user["last_name"]:
-        return "last_name"
-    if not user["course"]:
-        return "course"
-    if not user["group_name"]:
-        return "group_name"
-    return "ready"
-
+# ==================== RO'YXATDAN O'TISH ====================
 
 def start_user(user_id):
     user = get_user(user_id)
 
     if user is None:
-        add_user(user_id)
-        user = get_user(user_id)
-
-    state = next_registration_state(user)
-
-    if state == "ready":
-        set_state(user_id, "ready")
-
-        send(
+        save_user(
+            user_id,
+            first_name="",
+            last_name="",
+            course="",
+            group_name="",
+            state="first_name",
+            registered_at=datetime.now().isoformat(timespec="seconds"),
+            blocked=0
+        )
+        send_message(
             user_id,
             "Assalomu alaykum! 👋\n\n"
-            "Siz botda ro'yxatdan o'tgansiz.\n"
-            "Savol, taklif yoki murojaatingizni yuborishingiz mumkin.\n\n"
-            "Xabaringiz adminga yetkaziladi.",
-            reply_markup=user_keyboard()
+            "Botdan foydalanish uchun ro'yxatdan o'ting.\n"
+            "Ismingizni kiriting:"
         )
         return
 
-    set_state(user_id, state)
+    if not user["first_name"]:
+        set_state(user_id, "first_name")
+        send_message(user_id, "Ismingizni kiriting:")
+        return
 
-    prompts = {
-        "first_name": (
-            "Assalomu alaykum! 👋\n\n"
-            "Botimizga xush kelibsiz!\n"
-            "Boshlash uchun ismingizni kiriting."
-        ),
-        "last_name": "Rahmat! Endi familiyangizni kiriting.",
-        "course": (
-            "Qaysi kursda o'qiysiz?\n"
-            "Masalan: 1-kurs."
-        ),
-        "group_name": (
-            "Guruhingiz nomini kiriting.\n"
-            "Masalan: KI-26.03."
-        )
-    }
+    if not user["last_name"]:
+        set_state(user_id, "last_name")
+        send_message(user_id, "Familiyangizni kiriting:")
+        return
 
-    send(
+    if not user["course"]:
+        set_state(user_id, "course")
+        send_message(user_id, "Kursingizni kiriting:")
+        return
+
+    if not user["group_name"]:
+        set_state(user_id, "group_name")
+        send_message(user_id, "Guruhingizni kiriting:")
+        return
+
+    set_state(user_id, "ready")
+    send_message(
         user_id,
-        prompts[state],
-        reply_markup={"remove_keyboard": True}
+        "Xush kelibsiz! ✅\n\n"
+        "Ro'yxatdan o'tgansiz. Xabaringizni yuborishingiz "
+        "yoki quyidagi tugmalardan foydalanishingiz mumkin.",
+        admin_menu() if user_id == ADMIN_ID else user_menu()
     )
 
 
-def registration_step(message, user):
-    user_id = message["from"]["id"]
-    text = message.get("text", "").strip()
-    state = user["state"]
+def registration_step(user_id, text):
+    user = get_user(user_id)
 
-    if not text:
-        send(user_id, "Iltimos, javobingizni matn ko'rinishida yuboring.")
-        return
-
-    if len(text) > 100:
-        send(user_id, "Matn juda uzun. Iltimos, qisqaroq kiriting.")
-        return
-
-    fields = {
-        "first_name": ("first_name", "Familiyangizni kiriting."),
-        "last_name": ("last_name", "Kursingizni kiriting."),
-        "course": ("course", "Guruhingizni kiriting."),
-        "group_name": ("group_name", None)
-    }
-
-    if state not in fields:
+    if user is None:
         start_user(user_id)
-        return
+        return True
 
-    field, next_prompt = fields[state]
-    update_field(user_id, field, text)
+    state = user["state"] or "ready"
 
-    updated = get_user(user_id)
-    next_state = next_registration_state(updated)
-    set_state(user_id, next_state)
+    if state == "first_name":
+        save_user(user_id, first_name=text, state="last_name")
+        send_message(user_id, "Familiyangizni kiriting:")
+        return True
 
-    if next_state == "ready":
-        send(
+    if state == "last_name":
+        save_user(user_id, last_name=text, state="course")
+        send_message(user_id, "Kursingizni kiriting (masalan, 1-kurs):")
+        return True
+
+    if state == "course":
+        save_user(user_id, course=text, state="group_name")
+        send_message(user_id, "Guruhingizni kiriting:")
+        return True
+
+    if state == "group_name":
+        save_user(user_id, group_name=text, state="ready")
+        send_message(
             user_id,
-            "✅ Ro'yxatdan o'tish yakunlandi!\n\n"
-            "Endi savol, taklif va murojaatlaringizni shu bot orqali "
-            "yuborishingiz mumkin.\n\n"
-            "Rahmat!",
-            reply_markup=user_keyboard()
+            "Ro'yxatdan o'tish muvaffaqiyatli yakunlandi! ✅",
+            admin_menu() if user_id == ADMIN_ID else user_menu()
         )
-    else:
-        send(user_id, next_prompt)
-
-
-# ==================================================
-# FOYDALANUVCHI XABARINI ADMINGA YETKAZISH
-# ==================================================
-
-def forward_to_admin(message, user):
-    user_id = user["user_id"]
-
-    username = (
-        "@" + user["username"]
-        if user["username"]
-        else "Username mavjud emas"
-    )
-
-    copied = copy_message(
-        ADMIN_ID,
-        user_id,
-        message["message_id"]
-    )
-
-    if not copied.get("ok"):
-        send(
-            user_id,
-            "⚠️ Xabaringizni yetkazishda muammo yuz berdi. "
-            "Birozdan keyin qayta urinib ko'ring."
+        send_message(
+            ADMIN_ID,
+            "🆕 Yangi foydalanuvchi ro'yxatdan o'tdi.\n\n"
+            + user_info(user_id)
         )
-        return
+        return True
 
-    copied_id = copied["result"]["message_id"]
-    map_message(copied_id, user_id)
+    return False
 
-    info = (
-        "📩 YANGI MUROJAAT\n\n"
+
+def user_info(user_id):
+    user = get_user(user_id)
+    if not user:
+        return f"ID: {user_id}\nMa'lumot topilmadi."
+
+    return (
         f"👤 Ism: {user['first_name']}\n"
         f"👤 Familiya: {user['last_name']}\n"
         f"🎓 Kurs: {user['course']}\n"
         f"👥 Guruh: {user['group_name']}\n"
-        f"🔗 Username: {username}\n"
-        f"🆔 Telegram ID: {user_id}\n\n"
-        "Javob berish uchun yuqoridagi nusxaga Reply qiling."
-    )
-
-    info_result = send(ADMIN_ID, info)
-
-    if info_result.get("ok"):
-        map_message(info_result["result"]["message_id"], user_id)
-
-    send(
-        user_id,
-        "✅ Xabaringiz adminga yetkazildi!\n\n"
-        "Murojaatingiz ko'rib chiqiladi. Javob kelganda "
-        "shu bot orqali olasiz. Rahmat!"
+        f"🆔 Telegram ID: {user_id}"
     )
 
 
-# ==================================================
-# ADMIN JAVOBI
-# ==================================================
-
-def handle_admin_reply(message):
-    reply = message.get("reply_to_message")
-
-    if not reply:
-        send(
-            ADMIN_ID,
-            "Javob berish uchun foydalanuvchi xabariga Reply qiling."
-        )
-        return
-
-    user_id = find_user_by_admin_message(reply["message_id"])
-
-    if not user_id:
-        send(
-            ADMIN_ID,
-            "⚠️ Foydalanuvchi topilmadi. "
-            "Foydalanuvchi yuborgan xabar nusxasiga Reply qiling."
-        )
-        return
-
-    text = message.get("text", "")
-
-    if text.startswith("/"):
-        send(
-            ADMIN_ID,
-            "Buyruqni javob sifatida yubormang. Oddiy matn yoki media yuboring."
-        )
-        return
-
-    if "text" in message:
-        result = send(
-            user_id,
-            "📩 ADMIN JAVOBI\n\n" + message["text"]
-        )
-    else:
-        result = copy_message(
-            user_id,
-            ADMIN_ID,
-            message["message_id"]
-        )
-
-    if result.get("ok"):
-        send(ADMIN_ID, "✅ Javob foydalanuvchiga yuborildi.")
-    else:
-        send(
-            ADMIN_ID,
-            "❌ Javob yetkazilmadi. Foydalanuvchi botni bloklagan "
-            "bo'lishi yoki Telegramda xato yuz bergan bo'lishi mumkin."
-        )
+def edit_profile(user_id):
+    save_user(user_id, state="first_name")
+    send_message(user_id, "Yangi ismingizni kiriting:")
 
 
-# ==================================================
-# ADMIN STATISTIKASI
-# ==================================================
-
-def show_users():
-    rows = db.execute("""
-        SELECT first_name, last_name, course, group_name, user_id
-        FROM users
-        WHERE first_name != ''
-          AND last_name != ''
-          AND course != ''
-          AND group_name != ''
-        ORDER BY created_at DESC
-    """).fetchall()
-
-    send(ADMIN_ID, f"👥 Ro'yxatdan o'tganlar: {len(rows)}")
-
-    text = "📋 FOYDALANUVCHILAR\n\n"
-
-    for i, row in enumerate(rows, 1):
-        line = (
-            f"{i}. {row['first_name']} {row['last_name']}\n"
-            f"   {row['course']} | {row['group_name']}\n"
-            f"   ID: {row['user_id']}\n\n"
-        )
-
-        if len(text) + len(line) > 3500:
-            send(ADMIN_ID, text)
-            text = ""
-
-        text += line
-
-    if text.strip():
-        send(ADMIN_ID, text)
-
+# ==================== ADMIN FUNKSIYALARI ====================
 
 def show_stats():
-    total = db.execute(
-        "SELECT COUNT(*) AS n FROM users"
-    ).fetchone()["n"]
+    conn = db()
+    total = conn.execute(
+        "SELECT COUNT(*) FROM users"
+    ).fetchone()[0]
+    active = conn.execute(
+        "SELECT COUNT(*) FROM users WHERE blocked = 0"
+    ).fetchone()[0]
+    blocked = conn.execute(
+        "SELECT COUNT(*) FROM users WHERE blocked = 1"
+    ).fetchone()[0]
+    conn.close()
 
-    registered = len(registered_users())
-
-    last = db.execute("""
-        SELECT * FROM broadcast_log
-        ORDER BY id DESC LIMIT 1
-    """).fetchone()
-
-    text = (
-        "📊 BOT STATISTIKASI\n\n"
-        f"👤 Jami foydalanuvchilar: {total}\n"
-        f"✅ Ro'yxatdan o'tganlar: {registered}\n"
-    )
-
-    if last:
-        text += (
-            "\n📢 Oxirgi ommaviy xabar:\n"
-            f"🕒 {last['sent_at']}\n"
-            f"👥 Jami: {last['total']}\n"
-            f"✅ Yetkazildi: {last['delivered']}\n"
-            f"❌ Yetkazilmadi: {last['failed']}\n"
-        )
-
-    send(ADMIN_ID, text)
-
-
-# ==================================================
-# OMMAVIY XABAR
-# ==================================================
-
-def begin_broadcast():
-    global broadcast_state
-    broadcast_state = {"state": "waiting"}
-
-    send(
+    send_message(
         ADMIN_ID,
-        "📢 OMMAVIY XABAR\n\n"
-        "Barcha ro'yxatdan o'tgan foydalanuvchilarga yuboriladigan "
-        "matn, rasm, video yoki boshqa xabarni yuboring.\n\n"
-        "Avval ko'rib chiqasiz, keyin tasdiqlaysiz.\n"
-        "Bekor qilish: /cancel"
+        f"📊 STATISTIKA\n\n"
+        f"👥 Jami ro'yxatdan o'tganlar: {total}\n"
+        f"✅ Faol hisoblar: {active}\n"
+        f"🚫 Bloklanganlar: {blocked}"
     )
 
 
-def preview_broadcast(message):
-    global broadcast_state
-
-    broadcast_state = {
-        "state": "confirm",
-        "message_id": message["message_id"]
-    }
-
-    send(
-        ADMIN_ID,
-        "📋 Xabar tayyor.\n\n"
-        "Uni barcha ro'yxatdan o'tgan foydalanuvchilarga yuboraymi?",
-        reply_markup={
-            "inline_keyboard": [[
-                {
-                    "text": "✅ Yuborish",
-                    "callback_data": "broadcast_yes"
-                },
-                {
-                    "text": "❌ Bekor qilish",
-                    "callback_data": "broadcast_no"
-                }
-            ]]
-        }
-    )
-
-
-def execute_broadcast():
-    global broadcast_state
-
-    if not broadcast_state or broadcast_state.get("state") != "confirm":
-        send(ADMIN_ID, "Tasdiqlanadigan xabar topilmadi.")
-        return
-
-    source_id = broadcast_state["message_id"]
-    users = registered_users()
-
+def show_users():
+    users = all_users()
     if not users:
-        send(ADMIN_ID, "Ro'yxatdan o'tgan foydalanuvchilar yo'q.")
-        broadcast_state = None
+        send_message(ADMIN_ID, "Hozircha foydalanuvchilar yo'q.")
         return
 
-    send(ADMIN_ID, f"⏳ Yuborish boshlandi. Qabul qiluvchilar: {len(users)}")
+    send_message(ADMIN_ID, f"👥 Jami foydalanuvchilar: {len(users)}")
 
-    delivered = 0
-    failed = 0
+    # Telegram xabar uzunligi cheklangan; ro'yxat bo'lib yuboriladi.
+    chunk = ""
+    for user in users:
+        item = (
+            f"\n• {user['first_name']} {user['last_name']}\n"
+            f"  Kurs: {user['course']} | Guruh: {user['group_name']}\n"
+            f"  ID: {user['user_id']}\n"
+        )
+        if len(chunk) + len(item) > 3500:
+            send_message(ADMIN_ID, chunk)
+            chunk = ""
+        chunk += item
 
-    for user_id in users:
-        result = copy_message(user_id, ADMIN_ID, source_id)
+    if chunk:
+        send_message(ADMIN_ID, chunk)
 
-        if result.get("ok"):
-            delivered += 1
-        else:
-            failed += 1
 
-        # Telegram cheklovlariga rioya qilish
-        time.sleep(0.05)
-
-    with db:
-        db.execute("""
-            INSERT INTO broadcast_log
-            (sent_at, total, delivered, failed)
-            VALUES (?, ?, ?, ?)
-        """, (
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            len(users),
-            delivered,
-            failed
-        ))
-
-    broadcast_state = None
-
-    send(
-        ADMIN_ID,
-        "📊 YUBORISH YAKUNLANDI\n\n"
-        f"👥 Jami: {len(users)}\n"
-        f"✅ Yetkazildi: {delivered}\n"
-        f"❌ Yetkazilmadi: {failed}",
-        reply_markup=admin_keyboard()
+def save_reply_mapping(admin_message_id, user_id):
+    conn = db()
+    conn.execute(
+        "INSERT OR REPLACE INTO message_map (admin_message_id, user_id) "
+        "VALUES (?, ?)",
+        (admin_message_id, user_id)
     )
+    conn.commit()
+    conn.close()
 
 
-# ==================================================
-# CALLBACK TUGMALARI
-# ==================================================
+def find_reply_user(admin_message_id):
+    conn = db()
+    row = conn.execute(
+        "SELECT user_id FROM message_map WHERE admin_message_id = ?",
+        (admin_message_id,)
+    ).fetchone()
+    conn.close()
+    return row["user_id"] if row else None
 
-def process_callback(callback):
-    global broadcast_state
 
-    user_id = callback["from"]["id"]
-    data = callback.get("data", "")
-
-    if not is_admin(user_id):
-        tg("answerCallbackQuery", {
-            "callback_query_id": callback["id"],
-            "text": "Bu amal faqat admin uchun."
-        })
-        return
-
-    tg("answerCallbackQuery", {
-        "callback_query_id": callback["id"]
+def forward_user_message(message, user_id):
+    # Foydalanuvchining xabarini admin chatiga nusxalaydi.
+    result = tg("copyMessage", {
+        "chat_id": ADMIN_ID,
+        "from_chat_id": user_id,
+        "message_id": message["message_id"]
     })
 
-    if data == "broadcast_yes":
-        execute_broadcast()
-
-    elif data == "broadcast_no":
-        broadcast_state = None
-        send(
-            ADMIN_ID,
-            "❌ Ommaviy xabar bekor qilindi.",
-            reply_markup=admin_keyboard()
+    if not result:
+        send_message(
+            user_id,
+            "Xabaringizni yuborishda xatolik bo'ldi. "
+            "Birozdan so'ng qayta urinib ko'ring."
         )
+        return
+
+    admin_message_id = result["message_id"]
+    save_reply_mapping(admin_message_id, user_id)
+
+    send_message(
+        ADMIN_ID,
+        "📩 Yangi murojaat\n\n"
+        + user_info(user_id)
+        + "\n\nJavob berish uchun yuqoridagi nusxalangan "
+          "xabarga Reply orqali javob yozing."
+    )
+
+    send_message(user_id, "Xabaringiz adminga yetkazildi. ✅")
 
 
-# ==================================================
-# XABARLARNI QAYTA ISHLASH
-# ==================================================
+def reply_to_user(message, admin_user_id):
+    replied = message.get("reply_to_message")
+    if not replied:
+        return False
+
+    target_user = find_reply_user(replied["message_id"])
+    if not target_user:
+        return False
+
+    if message.get("text"):
+        result = send_message(target_user, "📩 Admin javobi:\n\n" + message["text"])
+    else:
+        # Matn bo'lmagan admin javobini nusxalash.
+        result = tg("copyMessage", {
+            "chat_id": target_user,
+            "from_chat_id": admin_user_id,
+            "message_id": message["message_id"]
+        })
+
+    if result:
+        send_message(ADMIN_ID, "Javob foydalanuvchiga yuborildi. ✅")
+    else:
+        send_message(ADMIN_ID, "Javob yuborilmadi. Foydalanuvchi botni bloklagan bo'lishi mumkin.")
+
+    return True
+
+
+# ==================== XABAR TARQATISH ====================
+
+def broadcast_preview(message):
+    if message.get("text", "").startswith("/broadcast"):
+        send_message(ADMIN_ID, "Tarqatish uchun /broadcast dan keyin matn yozing.")
+        return
+
+    broadcast_state[ADMIN_ID] = message["message_id"]
+
+    send_message(
+        ADMIN_ID,
+        "📢 Quyidagi xabar tarqatishga tayyor.\n"
+        "Yuborish yoki bekor qilishni tanlang.",
+        inline_keyboard([
+            [
+                {"text": "✅ Yuborish", "callback_data": "broadcast_confirm"},
+                {"text": "❌ Bekor qilish", "callback_data": "broadcast_cancel"}
+            ]
+        ])
+    )
+
+
+def do_broadcast():
+    source_message_id = broadcast_state.get(ADMIN_ID)
+    if not source_message_id:
+        send_message(ADMIN_ID, "Tarqatiladigan xabar topilmadi.")
+        return
+
+    users = all_users()
+    sent = 0
+    failed = 0
+
+    for user in users:
+        uid = user["user_id"]
+        if user["blocked"]:
+            continue
+
+        result = tg("copyMessage", {
+            "chat_id": uid,
+            "from_chat_id": ADMIN_ID,
+            "message_id": source_message_id
+        })
+
+        if result:
+            sent += 1
+        else:
+            failed += 1
+            # Xatolik foydalanuvchi botni bloklagani sababli bo'lishi mumkin.
+            # Keyinroq qayta urinib ko'rish uchun hisob o'chirilmaydi.
+
+        time.sleep(0.05)
+
+    conn = db()
+    conn.execute(
+        "INSERT INTO broadcast_log (sent_at, sent_count, failed_count) "
+        "VALUES (?, ?, ?)",
+        (datetime.now().isoformat(timespec="seconds"), sent, failed)
+    )
+    conn.commit()
+    conn.close()
+
+    broadcast_state.pop(ADMIN_ID, None)
+    send_message(
+        ADMIN_ID,
+        f"📢 Tarqatish yakunlandi.\n\n"
+        f"✅ Yuborildi: {sent}\n"
+        f"⚠️ Yuborilmadi: {failed}",
+        admin_menu()
+    )
+
+
+# ==================== CALLBACKLAR ====================
+
+def process_callback(callback):
+    data = callback.get("data", "")
+    callback_id = callback["id"]
+    user_id = callback["from"]["id"]
+
+    if user_id != ADMIN_ID:
+        answer_callback(callback_id, "Bu amal faqat admin uchun.")
+        return
+
+    if data == "broadcast_confirm":
+        answer_callback(callback_id, "Tarqatish boshlandi.")
+        do_broadcast()
+    elif data == "broadcast_cancel":
+        broadcast_state.pop(ADMIN_ID, None)
+        answer_callback(callback_id, "Bekor qilindi.")
+        send_message(ADMIN_ID, "Tarqatish bekor qilindi.", admin_menu())
+    else:
+        answer_callback(callback_id)
+
+
+# ==================== XABARLARNI QAYTA ISHLASH ====================
 
 def process_message(message):
-    sender = message.get("from", {})
-    user_id = sender.get("id")
+    # global funksiyaning boshida e'lon qilinadi.
+    global broadcast_state
 
-    if not user_id:
+    chat = message.get("chat", {})
+    user = message.get("from", {})
+    user_id = user.get("id")
+    chat_id = chat.get("id")
+
+    if not user_id or chat.get("type") != "private":
         return
 
     text = message.get("text", "").strip()
-    username = sender.get("username", "")
+    is_admin = user_id == ADMIN_ID
 
     logging.info(
-        "Xabar keldi: user_id=%s, admin=%s, text=%r",
-        user_id,
-        is_admin(user_id),
-        text[:100]
+        "Xabar keldi: user_id=%s admin=%s text=%r",
+        user_id, is_admin, text[:100]
     )
 
-    # -------------------------
-    # ADMIN
-    # -------------------------
-    if is_admin(user_id):
-
-        if text == "/start":
-            send(
-                ADMIN_ID,
-                "Assalomu alaykum, admin! 🛠\n\n"
-                "/users — foydalanuvchilar\n"
-                "/stats — statistika\n"
-                "/broadcast — hammaga xabar\n"
-                "/cancel — bekor qilish",
-                reply_markup=admin_keyboard()
-            )
-            return
-
-        if text in ("/users", "👥 Foydalanuvchilar"):
-            show_users()
-            return
-
-        if text in ("/stats", "📊 Statistika"):
-            show_stats()
-            return
-
-        if text in ("/broadcast", "📢 Hammaga xabar"):
-            begin_broadcast()
-            return
-
-        if text in ("/cancel", "❌ Bekor qilish"):
-            global broadcast_state
-            broadcast_state = None
-            send(
-                ADMIN_ID,
-                "❌ Joriy amal bekor qilindi.",
-                reply_markup=admin_keyboard()
-            )
-            return
-
-        if broadcast_state and broadcast_state["state"] == "waiting":
-            if text == "/help":
-                send(ADMIN_ID, "Xabar yuboring yoki /cancel yozing.")
-                return
-
-            preview_broadcast(message)
-            return
-
-        if broadcast_state and broadcast_state["state"] == "confirm":
-            send(
-                ADMIN_ID,
-                "Avval xabarni tasdiqlang yoki bekor qiling."
-            )
-            return
-
-        if message.get("reply_to_message"):
-            handle_admin_reply(message)
-            return
-
-        send(
-            ADMIN_ID,
-            "Admin paneli:\n"
-            "/users — foydalanuvchilar\n"
-            "/stats — statistika\n"
-            "/broadcast — hammaga xabar\n"
-            "/cancel — bekor qilish\n\n"
-            "Foydalanuvchiga javob berish uchun uning xabariga Reply qiling.",
-            reply_markup=admin_keyboard()
-        )
-        return
-
-    # -------------------------
-    # ODDIY FOYDALANUVCHI
-    # -------------------------
-
-    # Bot faqat shaxsiy chatda ishlaydi
-    if message.get("chat", {}).get("type") != "private":
-        return
-
-    add_user(user_id, username)
-
-    # /start har doim birinchi navbatda tekshiriladi
-    if text == "/start" or text.startswith("/start "):
+    # Bot buyruqlari.
+    if text == "/start":
         start_user(user_id)
-        return
-
-    if text == "/help" or text == "ℹ️ Yordam":
-        send(
-            user_id,
-            "ℹ️ YORDAM\n\n"
-            "Admin bilan bog'lanish uchun xabaringizni shu chatga yozing.\n"
-            "Xabaringiz adminga yetkaziladi va javob shu yerga keladi.",
-            reply_markup=user_keyboard()
-        )
         return
 
     if text == "/cancel":
-        user = get_user(user_id)
-        if user:
-            set_state(user_id, next_registration_state(user))
-
-        send(
-            user_id,
-            "Joriy amal bekor qilindi.",
-            reply_markup=user_keyboard()
+        broadcast_state.pop(ADMIN_ID, None)
+        set_state(user_id, "ready")
+        send_message(
+            chat_id,
+            "Amal bekor qilindi.",
+            admin_menu() if is_admin else user_menu()
         )
         return
 
-    user = get_user(user_id)
+    if text == "/help" or text == "ℹ️ Yordam":
+        send_message(
+            chat_id,
+            "ℹ️ YORDAM\n\n"
+            "• Ma'lumotlaringizni ro'yxatdan o'tkazing.\n"
+            "• Adminga murojaat qilish uchun tugmani bosing.\n"
+            "• Ma'lumotlarni tahrirlash mumkin.\n"
+            "• Bekor qilish: /cancel",
+            admin_menu() if is_admin else user_menu()
+        )
+        return
 
-    if not user:
+    # Admin xabariga Reply orqali javob bersa.
+    if is_admin and message.get("reply_to_message"):
+        if reply_to_user(message, user_id):
+            return
+
+    # Ro'yxatdan o'tish jarayoni.
+    current_user = get_user(user_id)
+    if current_user is None:
         start_user(user_id)
         return
 
-    # Ma'lumotlarni o'zgartirish
-    if text == "✏️ Ma'lumotlarimni o'zgartirish":
-        set_state(user_id, "edit_choice")
-        send(
-            user_id,
-            "Qaysi ma'lumotni o'zgartirasiz?\n\n"
-            "Ism, familiya, kurs yoki guruh deb yozing.\n"
-            "Bekor qilish: /cancel"
+    if current_user["state"] and current_user["state"] != "ready":
+        if text:
+            registration_step(user_id, text)
+        else:
+            send_message(chat_id, "Iltimos, matn ko'rinishida javob kiriting.")
+        return
+
+    # Admin buyruqlari.
+    if is_admin:
+        if text == "/admin":
+            send_message(chat_id, "Admin panel:", admin_menu())
+            return
+
+        if text == "📊 Statistika" or text == "/stats":
+            show_stats()
+            return
+
+        if text == "👥 A'zolar" or text == "/users":
+            show_users()
+            return
+
+        if text == "✏️ Ma'lumotlarim":
+            edit_profile(user_id)
+            return
+
+        if text == "📩 Murojaatlar":
+            send_message(
+                ADMIN_ID,
+                "📩 Murojaatlar shu chatga keladi. Foydalanuvchiga javob berish "
+                "uchun murojaatning nusxalangan xabariga Reply qiling."
+            )
+            return
+
+        if text == "📢 Xabar yuborish" or text == "/broadcast":
+            set_state(ADMIN_ID, "ready")
+            broadcast_state.pop(ADMIN_ID, None)
+            send_message(
+                ADMIN_ID,
+                "Tarqatmoqchi bo'lgan matn yoki media xabaringizni yuboring.\n"
+                "Bekor qilish: /cancel"
+            )
+            broadcast_state[ADMIN_ID] = "waiting"
+            return
+
+        if broadcast_state.get(ADMIN_ID) == "waiting":
+            # Xabar adminning o'zidan kelgani uchun nusxasi shu xabardan olinadi.
+            broadcast_state[ADMIN_ID] = message["message_id"]
+            send_message(
+                ADMIN_ID,
+                "📢 Xabarni barcha ro'yxatdan o'tgan foydalanuvchilarga yuboraymi?",
+                inline_keyboard([
+                    [
+                        {"text": "✅ Yuborish", "callback_data": "broadcast_confirm"},
+                        {"text": "❌ Bekor qilish", "callback_data": "broadcast_cancel"}
+                    ]
+                ])
+            )
+            return
+
+        # Admin oddiy xabar yozsa, unga izoh beramiz.
+        send_message(
+            ADMIN_ID,
+            "Admin paneldan foydalaning yoki foydalanuvchi xabariga "
+            "Reply orqali javob bering.",
+            admin_menu()
         )
         return
 
-    if user["state"] == "edit_choice":
-        choices = {
-            "ism": ("first_name", "Yangi ismingizni kiriting."),
-            "familiya": ("last_name", "Yangi familiyangizni kiriting."),
-            "kurs": ("course", "Yangi kursingizni kiriting."),
-            "guruh": ("group_name", "Yangi guruhingizni kiriting.")
-        }
-
-        choice = choices.get(text.lower())
-
-        if not choice:
-            send(user_id, "Ism, familiya, kurs yoki guruh deb yozing.")
-            return
-
-        field, prompt = choice
-        set_state(user_id, "edit_" + field)
-        send(user_id, prompt)
+    # Foydalanuvchi menyusi.
+    if text == "✏️ Ma'lumotlarim":
+        edit_profile(user_id)
         return
 
-    if user["state"].startswith("edit_"):
-        field = user["state"][5:]
-
-        if not text:
-            send(user_id, "Iltimos, yangi ma'lumotni matn ko'rinishida yuboring.")
-            return
-
-        update_field(user_id, field, text)
-        set_state(user_id, next_registration_state(get_user(user_id)))
-        send(
+    if text == "📩 Adminga murojaat":
+        send_message(
             user_id,
-            "✅ Ma'lumotingiz yangilandi.",
-            reply_markup=user_keyboard()
+            "Xabaringizni yozib yuboring. Adminga yetkazaman."
         )
+        set_state(user_id, "contact_message")
         return
 
-    # Ro'yxatdan o'tish hali tugamagan bo'lsa
-    if next_registration_state(user) != "ready":
-        set_state(user_id, next_registration_state(user))
-        registration_step(message, get_user(user_id))
+    if current_user["state"] == "contact_message":
+        if text:
+            set_state(user_id, "ready")
+            forward_user_message(message, user_id)
+        else:
+            send_message(user_id, "Iltimos, murojaatingizni matn bilan yuboring.")
         return
 
-    # Ro'yxatdan o'tgan foydalanuvchining istalgan xabari
-    forward_to_admin(message, user)
+    # Ro'yxatdan o'tgan foydalanuvchining oddiy xabari.
+    forward_user_message(message, user_id)
 
 
-# ==================================================
-# ISHGA TUSHIRISH
-# ==================================================
+# ==================== ASOSIY ISHGA TUSHIRISH ====================
 
 def main():
-    logging.info("Bot ishga tushmoqda...")
-
-    # Webhook polling bilan to'qnashmasligi uchun o'chiriladi
-    webhook = tg("deleteWebhook", {"drop_pending_updates": False})
-
-    if not webhook.get("ok"):
-        logging.warning("Webhook holatini tekshiring.")
-
-    me = tg("getMe")
-
-    if not me.get("ok"):
+    if not BOT_TOKEN:
         raise RuntimeError(
-            "Bot tokeni noto'g'ri yoki Telegram API bilan aloqa yo'q."
+            "BOT_TOKEN topilmadi. Hosting Variables/Secrets bo'limida "
+            "BOT_TOKEN nomli o'zgaruvchi yarating."
         )
 
-    logging.info(
-        "Bot faol: @%s | Admin ID: %s",
-        me["result"].get("username"),
-        ADMIN_ID
-    )
+    init_db()
 
-    offset = None
+    me = tg("getMe")
+    if not me:
+        raise RuntimeError(
+            "Bot tokeni ishlamayapti yoki Telegram API bilan ulanish bo'lmadi."
+        )
+
+    logging.info("Bot ishga tushdi: @%s", me.get("username"))
+
+    # Webhook long polling bilan bir vaqtda ishlamasligi kerak.
+    tg("deleteWebhook", {"drop_pending_updates": "false"})
+
+    offset = 0
 
     while True:
         try:
-            params = {
+            updates = tg("getUpdates", {
+                "offset": offset,
                 "timeout": 25,
-                "allowed_updates": ["message", "callback_query"]
-            }
+                "allowed_updates": '["message","callback_query"]'
+            }, timeout=35)
 
-            if offset is not None:
-                params["offset"] = offset
-
-            updates = tg("getUpdates", params, timeout=35)
-
-            if not updates.get("ok"):
-                logging.error(
-                    "getUpdates ishlamadi. Boshqa bot nusxasi "
-                    "yoki webhook mavjudligini tekshiring."
-                )
+            if updates is None:
                 time.sleep(3)
                 continue
 
-            for update in updates.get("result", []):
+            for update in updates:
                 offset = update["update_id"] + 1
 
                 try:
                     if "message" in update:
                         process_message(update["message"])
-
                     elif "callback_query" in update:
                         process_callback(update["callback_query"])
-
                 except Exception:
                     logging.exception(
                         "Update qayta ishlanmadi: %s",
@@ -915,7 +760,6 @@ def main():
         except KeyboardInterrupt:
             logging.info("Bot to'xtatildi.")
             break
-
         except Exception:
             logging.exception("Asosiy siklda xato")
             time.sleep(3)
