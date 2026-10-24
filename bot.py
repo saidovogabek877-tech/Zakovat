@@ -6,7 +6,7 @@ TOKEN = os.getenv('BOT_TOKEN')
 if not TOKEN:
     raise RuntimeError('BOT_TOKEN topilmadi. Hosting Environment sozlamalarini tekshiring.')
 ADMIN_ID = 5607350126
-CHANNEL = '@zakalgoritm'
+CHANNEL = '@shaxmatchi_bolakay'
 API = f'https://api.telegram.org/bot{TOKEN}'
 TZ = timezone(timedelta(hours=5))
 DB_FILE = 'zakovat.db'
