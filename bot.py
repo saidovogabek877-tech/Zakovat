@@ -20,18 +20,25 @@ logging.basicConfig(
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN hosting sozlamalarida mavjud emas.")
 
+
 # ============== TELEGRAM API ==============
 
 def tg(method, data=None, timeout=40):
     try:
-        r = requests.post(
+        response = requests.post(
             f"{API_URL}/{method}",
             json=data or {},
             timeout=timeout
         )
-        result = r.json()
+        result = response.json()
+
         if not result.get("ok"):
-            logging.error("%s: %s", method, result.get("description"))
+            logging.error(
+                "%s xatosi: %s",
+                method,
+                result.get("description")
+            )
+
         return result
     except Exception:
         logging.exception("Telegram API xatosi")
@@ -68,6 +75,7 @@ def init_db():
                 registered INTEGER DEFAULT 0
             )
         """)
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS reply_map (
                 message_id INTEGER PRIMARY KEY,
@@ -75,7 +83,6 @@ def init_db():
             )
         """)
 
-        # Eski bazada ustun yetishmasa, avtomatik qo'shish.
         columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(users)")
@@ -101,7 +108,8 @@ def init_db():
 def get_user(user_id):
     with db() as conn:
         return conn.execute(
-            "SELECT * FROM users WHERE user_id = ?", (user_id,)
+            "SELECT * FROM users WHERE user_id = ?",
+            (user_id,)
         ).fetchone()
 
 
@@ -110,6 +118,7 @@ def set_field(user_id, field, value):
         "username", "first_name", "last_name",
         "course", "group_name", "step", "registered"
     }
+
     if field not in allowed:
         return
 
@@ -136,11 +145,10 @@ def ensure_user(tg_user):
 
 def save_reply_map(message_id, user_id):
     with db() as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO reply_map (message_id, user_id) "
-            "VALUES (?, ?)",
-            (message_id, user_id)
-        )
+        conn.execute("""
+            INSERT OR REPLACE INTO reply_map (message_id, user_id)
+            VALUES (?, ?)
+        """, (message_id, user_id))
 
 
 def find_reply_user(message_id):
@@ -149,6 +157,7 @@ def find_reply_user(message_id):
             "SELECT user_id FROM reply_map WHERE message_id = ?",
             (message_id,)
         ).fetchone()
+
     return row["user_id"] if row else None
 
 
@@ -178,13 +187,14 @@ def ask(chat_id, step):
             "Guruhingiz bo'lmasa, «Yo'q» deb yozing."
         )
     }
+
     send(chat_id, prompts.get(step, prompts["name"]))
 
 
 def full_name(user):
-    return (
-        f"{user['first_name']} {user['last_name']}"
-    ).strip() or "Ko'rsatilmagan"
+    first = user["first_name"] or ""
+    last = user["last_name"] or ""
+    return (first + " " + last).strip() or "Ko'rsatilmagan"
 
 
 def finish_registration(chat_id, user_id):
@@ -192,14 +202,17 @@ def finish_registration(chat_id, user_id):
     set_field(user_id, "step", "done")
 
     user = get_user(user_id)
-    username = f"@{user['username']}" if user["username"] else "Mavjud emas"
+    name = full_name(user)
+    course = user["course"] or "Ko'rsatilmagan"
+    group_name = user["group_name"] or "Ko'rsatilmagan"
+    username = "@" + user["username"] if user["username"] else "Mavjud emas"
 
     send(
         chat_id,
         "🎉 Ro'yxatdan muvaffaqiyatli o'tdingiz!\n\n"
-        f"👤 Ism-familiya: {full_name(user)}\n"
-        f"🎓 Kurs: {user['course'] or 'Ko'rsatilmagan'}\n"
-        f"👥 Guruh: {user['group_name'] or 'Ko'rsatilmagan'}\n\n"
+        f"👤 Ism-familiya: {name}\n"
+        f"🎓 Kurs: {course}\n"
+        f"👥 Guruh: {group_name}\n\n"
         "Endi botdan bemalol foydalanishingiz mumkin. 💬\n"
         "Savol yoki murojaatingiz bo'lsa, xabaringizni yuboring."
     )
@@ -207,9 +220,9 @@ def finish_registration(chat_id, user_id):
     send(
         ADMIN_ID,
         "🆕 YANGI FOYDALANUVCHI RO'YXATDAN O'TDI\n\n"
-        f"👤 Ism-familiya: {full_name(user)}\n"
-        f"🎓 Kurs: {user['course'] or 'Ko'rsatilmagan'}\n"
-        f"👥 Guruh: {user['group_name'] or 'Ko'rsatilmagan'}\n"
+        f"👤 Ism-familiya: {name}\n"
+        f"🎓 Kurs: {course}\n"
+        f"👥 Guruh: {group_name}\n"
         f"🔗 Username: {username}\n"
         f"🆔 Telegram ID: {user_id}"
     )
@@ -237,17 +250,13 @@ def registration_step(message, user):
         ask(chat_id, "course")
 
     elif step == "course":
-        value = "" if text.lower() in {
-            "yo'q", "yo‘q", "yoq", "-", "нет"
-        } else text[:100]
+        value = "" if text.lower() in ("yo'q", "yo‘q", "yoq", "-", "нет") else text[:100]
         set_field(user_id, "course", value)
         set_field(user_id, "step", "group_name")
         ask(chat_id, "group_name")
 
     elif step == "group_name":
-        value = "" if text.lower() in {
-            "yo'q", "yo‘q", "yoq", "-", "нет"
-        } else text[:100]
+        value = "" if text.lower() in ("yo'q", "yo‘q", "yoq", "-", "нет") else text[:100]
         set_field(user_id, "group_name", value)
         finish_registration(chat_id, user_id)
 
@@ -256,14 +265,19 @@ def registration_step(message, user):
 
 def forward_to_admin(message, user):
     user_id = user["user_id"]
-    username = f"@{user['username']}" if user["username"] else "Mavjud emas"
+
+    name = user["first_name"] or "Ko'rsatilmagan"
+    surname = user["last_name"] or "Ko'rsatilmagan"
+    course = user["course"] or "Ko'rsatilmagan"
+    group_name = user["group_name"] or "Ko'rsatilmagan"
+    username = "@" + user["username"] if user["username"] else "Mavjud emas"
 
     info = (
         "📩 FOYDALANUVCHIDAN YANGI MUROJAAT\n\n"
-        f"👤 Ism: {user['first_name'] or 'Ko'rsatilmagan'}\n"
-        f"📝 Familiya: {user['last_name'] or 'Ko'rsatilmagan'}\n"
-        f"🎓 Kurs: {user['course'] or 'Ko'rsatilmagan'}\n"
-        f"👥 Guruh: {user['group_name'] or 'Ko'rsatilmagan'}\n"
+        f"👤 Ism: {name}\n"
+        f"📝 Familiya: {surname}\n"
+        f"🎓 Kurs: {course}\n"
+        f"👥 Guruh: {group_name}\n"
         f"🔗 Username: {username}\n"
         f"🆔 Telegram ID: {user_id}\n\n"
         "💬 Foydalanuvchi yuborgan xabar quyida.\n"
@@ -271,6 +285,7 @@ def forward_to_admin(message, user):
     )
 
     info_result = send(ADMIN_ID, info)
+
     if info_result.get("ok"):
         save_reply_map(info_result["result"]["message_id"], user_id)
 
@@ -283,7 +298,7 @@ def forward_to_admin(message, user):
     if copied.get("ok"):
         save_reply_map(copied["result"]["message_id"], user_id)
     else:
-        logging.error("Foydalanuvchi xabarini adminga nusxalab bo'lmadi.")
+        logging.error("Foydalanuvchi xabarini adminga yuborib bo'lmadi.")
 
 
 # ============== ADMIN JAVOBI ==============
@@ -328,7 +343,7 @@ def admin_reply(message):
         send(
             ADMIN_ID,
             "❌ Javob yuborilmadi. Foydalanuvchi botni bloklagan "
-            "yoki bot bilan hali shaxsiy chatni boshlamagan bo'lishi mumkin."
+            "bo'lishi mumkin."
         )
 
 
@@ -336,6 +351,7 @@ def admin_reply(message):
 
 def handle_message(message):
     sender = message.get("from")
+
     if not sender or sender.get("is_bot"):
         return
 
@@ -346,13 +362,13 @@ def handle_message(message):
     chat_id = message["chat"]["id"]
     text = (message.get("text") or "").strip()
 
-    # ADMIN
+    # Admin
     if user_id == ADMIN_ID:
         if text == "/start":
             send(
                 ADMIN_ID,
                 "👋 Admin paneliga xush kelibsiz!\n\n"
-                "📨 Foydalanuvchi xabariga Reply qilib javob yuboring.\n"
+                "Foydalanuvchi xabariga Reply qilib javob yuboring.\n"
                 "/users — foydalanuvchilar statistikasi"
             )
             return
@@ -362,6 +378,7 @@ def handle_message(message):
                 total = conn.execute(
                     "SELECT COUNT(*) AS n FROM users"
                 ).fetchone()["n"]
+
                 registered = conn.execute(
                     "SELECT COUNT(*) AS n FROM users WHERE registered = 1"
                 ).fetchone()["n"]
@@ -377,7 +394,7 @@ def handle_message(message):
         admin_reply(message)
         return
 
-    # FOYDALANUVCHI
+    # Oddiy foydalanuvchi
     ensure_user(sender)
     user = get_user(user_id)
 
@@ -411,7 +428,7 @@ def handle_message(message):
 def main():
     init_db()
 
-    webhook = tg("deleteWebhook", {"drop_pending_updates": False})
+    tg("deleteWebhook", {"drop_pending_updates": False})
     me = tg("getMe")
 
     if not me.get("ok"):
@@ -419,7 +436,10 @@ def main():
             "Bot tokeni noto'g'ri yoki Telegram bilan aloqa yo'q."
         )
 
-    logging.info("Bot ishga tushdi: @%s", me["result"].get("username"))
+    logging.info(
+        "Bot ishga tushdi: @%s",
+        me["result"].get("username", "")
+    )
 
     offset = None
 
@@ -429,6 +449,7 @@ def main():
                 "timeout": 30,
                 "allowed_updates": ["message"]
             }
+
             if offset is not None:
                 params["offset"] = offset
 
@@ -440,6 +461,7 @@ def main():
 
             for update in result.get("result", []):
                 offset = update["update_id"] + 1
+
                 if "message" in update:
                     try:
                         handle_message(update["message"])
@@ -449,10 +471,12 @@ def main():
         except KeyboardInterrupt:
             logging.info("Bot to'xtatildi.")
             break
+
         except Exception:
             logging.exception("Asosiy siklda xato")
             time.sleep(3)
 
 
 if __name__ == "__main__":
+    init_db()
     main()
